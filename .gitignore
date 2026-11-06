@@ -1,0 +1,27 @@
+# Archive of this same project. 490 MB, over GitHub's 100 MB file limit.
+AR4_URDF.zip
+*.zip
+
+# Upstream clone of Annin's HMI, 522 MB with its own .git history.
+# Re-clone it if needed: https://github.com/Annin-Robotics/ar4-hmi.git
+AR4-Native/ar4-hmi/
+
+# Rhino / Grasshopper backups and autosaves
+*.3dmbak
+*.ghbak
+*.rhl
+**/AutoSave/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
