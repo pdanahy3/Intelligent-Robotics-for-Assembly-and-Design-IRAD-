@@ -44,7 +44,16 @@ INPUTS — original required inputs
 ---------------------------------
 cache_id            : from Startup component
 Targets             : TCP target planes, points, or plane-like values (mm origins)
-Speed               : arm move speed value, normally firmware Sm value
+Speed               : arm move speed, percent of max step rate (1-100,
+                      default 25), emitted as firmware Sp.
+
+                      This was Sm (mm/sec). The RJ handler never populates
+                      xyzuvw_In, but driveMotorsJ's Sm branch derives the
+                      move's total time from the distance between it and the
+                      current pose, so every move was timed against stale
+                      Cartesian state. Sp sets the step gap directly from
+                      minSpeedDelay and is independent of move length, so the
+                      joint speed is identical for every command.
 Accel               : firmware Ac percent
 Decel               : firmware Dc percent
 Ramp                : firmware Rm value
@@ -1956,7 +1965,7 @@ def build_rj_command(
     use_calibration_frame,
     track_length_mm,
     track_firmware_inverted,
-    speed_type="m"
+    speed_type="p"
 ):
     """
     Builds an RJ command string from URDF TrackM + J1-J6.
@@ -1991,7 +2000,7 @@ def build_rj_command(
 
     speed_type = str(speed_type).strip().lower()
     if speed_type not in ["m", "p", "s"]:
-        speed_type = "m"
+        speed_type = "p"
 
     loop_mode = "000000"
 
@@ -2365,9 +2374,17 @@ try:
 
         solve_started = time.time()
 
-        speed = to_float(Speed, 5.0)
+        # Percent of the controller's maximum step rate. Sp makes the step gap
+        # independent of how far a move travels, so every command in a sequence
+        # runs at the same joint speed.
+        speed = clamp(to_float(Speed, 25.0), 1.0, 100.0)
         accel = to_float(Accel, 5.0)
         decel = to_float(Decel, 5.0)
+
+        # Ramp 10 means k_acc = k_dec = 1, which makes the firmware's start and
+        # end delays equal to the cruise delay, so there is no per-command
+        # accel/decel at all. Anything above 10 slows the ends of every single
+        # move and is what makes a dense point sequence surge between points.
         ramp = to_float(Ramp, 10.0)
         wrist = to_text(Wrist, "F")
 
@@ -2456,7 +2473,7 @@ try:
                 use_calibration_frame=use_calibration_frame,
                 track_length_mm=track_length_mm,
                 track_firmware_inverted=track_firmware_inverted,
-                speed_type="m"
+                speed_type="p"
             )
 
             # Optional legacy behavior: move J7 alone first, then the arm.
@@ -2505,7 +2522,7 @@ try:
                 "target_index": target_index,
                 "type": "track_preposition_followup" if split_track_motion else "synchronized_target",
                 "command": cmd,
-                "speed_type": "m",
+                "speed_type": "p",
                 "speed": speed,
                 "track_m": track_m,
                 "j7_mm": j7,

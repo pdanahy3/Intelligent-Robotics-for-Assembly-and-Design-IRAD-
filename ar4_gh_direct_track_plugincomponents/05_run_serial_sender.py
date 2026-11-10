@@ -25,6 +25,28 @@ Optional GH inputs:
   EncodeFirmwareOnSend : bool, default True (or sticky AR4_ENCODE_FIRMWARE_ON_SEND)
   HomeJointsDeg        : 6 floats, default sticky / [16,0,0,0,22,-10]
   JointSigns           : 6 floats, default sticky / 1,1,1,1,1,1
+  MaxInFlight          : int 1-2, default 2. Commands allowed to sit
+                         unacknowledged in the controller's queue.
+  WaitForReply         : bool, default False. True forces strict
+                         call-and-response (MaxInFlight is then 1).
+  TimeoutPerCommand    : float seconds, default 300. Must exceed the longest
+                         single move, since the reply only arrives once the
+                         move completes.
+
+Flow control
+------------
+The firmware holds three commands (cmdBuffer1..3) and reads serial one byte
+per loop() iteration, only while cmdBuffer3 is empty. A move blocks loop(),
+so nothing is read for the whole duration of that move. Sending without
+waiting for replies therefore backs data up into the USB buffer until a host
+write blocks, which appeared as a stall partway through long programs. This
+component never leaves more than MaxInFlight commands unacknowledged, so the
+controller's queue absorbs the look-ahead and writes never block.
+
+Note that each RJ command accelerates from and decelerates to a full stop, so
+a long point sequence moves in discrete steps regardless of pacing. Continuous
+velocity needs the firmware's spline mode (SL / MS / SS), which acknowledges
+on receipt rather than on completion.
 """
 
 import time
@@ -324,7 +346,6 @@ def validate_rj_command(command):
         "J7",
         "J8",
         "J9",
-        "Sm",
         "Ac",
         "Dc",
         "Rm",
@@ -335,6 +356,18 @@ def validate_rj_command(command):
     for token in required_tokens:
         if token not in s:
             return False, "Missing token {}.".format(token)
+
+    # The speed token is S followed by a type letter. The firmware accepts
+    # s (seconds), m (mm/sec) and p (percent); requiring a literal "Sm" here
+    # used to reject every command as soon as the planner emitted anything else.
+    speed_at = s.find("J9")
+    speed_at = s.find("S", speed_at if speed_at >= 0 else 0)
+
+    if speed_at < 0 or speed_at + 1 >= len(s):
+        return False, "Missing speed token S."
+
+    if s[speed_at + 1] not in ("s", "m", "p"):
+        return False, "Speed type S{} is not one of s, m, p.".format(s[speed_at + 1])
 
     # This catches the earlier malformed external-axis form:
     # J70.500J00.000J00.000
@@ -480,66 +513,127 @@ def parse_rp_line(rp):
 # Serial helpers
 # ------------------------------------------------------------
 
-def read_reply_for_command(ser, timeout, wait_for_rp=True):
+REPLY_RP = "RP"
+REPLY_ERROR_ER = "ERROR_ER"
+REPLY_ERROR_EL = "ERROR_EL"
+
+# cmdBuffer1..3 in the firmware. One is executing, so two can be staged.
+FIRMWARE_QUEUE_DEPTH = 3
+
+
+def is_rp_line(line):
+    return line.startswith("A") and "B" in line and "C" in line and "P" in line
+
+
+class ReplyStream:
     """
-    Reads serial response after one command.
+    Rolling line reader over one open port.
 
-    For RJ, the firmware should eventually return a position line.
-    This function also stops early if it sees ER/EL-style errors.
+    The previous reader rebuilt its buffer per command, so any bytes it pulled
+    past the end of one reply were dropped, and anything the firmware emitted
+    between replies could shift the stream permanently out of step with the
+    commands. One buffer for the whole run keeps acknowledgements aligned with
+    the commands that caused them.
     """
-    buffer = ""
-    start = time.time()
 
-    while time.time() - start < timeout:
-        if ser.in_waiting > 0:
-            data = ser.read(ser.in_waiting)
-            text = data.decode("utf-8", errors="ignore")
-            buffer += text
+    def __init__(self, ser):
+        self.ser = ser
+        self.buffer = ""
+        self.seen = []
 
-            lines = [line.strip() for line in buffer.splitlines() if line.strip()]
+    def pump(self):
+        """Move available bytes into completed lines. Returns the new lines."""
+        fresh = []
 
-            for line in lines:
-                # Firmware error strings.
+        try:
+            waiting = self.ser.in_waiting
+        except Exception:
+            waiting = 0
+
+        if waiting > 0:
+            data = self.ser.read(waiting)
+            self.buffer += data.decode("utf-8", errors="ignore")
+
+            while "\n" in self.buffer:
+                line, self.buffer = self.buffer.split("\n", 1)
+                line = line.strip()
+
+                if line:
+                    fresh.append(line)
+                    self.seen.append(line)
+
+        return fresh
+
+    def next_ack(self, timeout):
+        """
+        Wait for one terminal reply: an RP position line, ER, or EL.
+
+        Returns (status, line). Lines the firmware prints that are not terminal
+        replies are collected but do not end the wait.
+        """
+        deadline = time.time() + timeout
+        other = []
+
+        while True:
+            for line in self.pump():
                 if line == "ER":
-                    return lines, buffer, "ERROR_ER"
+                    return REPLY_ERROR_ER, line
 
                 if line.startswith("EL"):
-                    return lines, buffer, "ERROR_EL"
+                    return REPLY_ERROR_EL, line
 
-                # RP-style position line.
-                if line.startswith("A") and "B" in line and "C" in line and "P" in line:
-                    return lines, buffer, "RP"
+                if is_rp_line(line):
+                    return REPLY_RP, line
 
-            # If we are not specifically waiting for an RP line, return after first line.
-            if not wait_for_rp and "\n" in buffer:
-                return lines, buffer, "LINE"
+                other.append(line)
 
-        time.sleep(0.02)
+            if time.time() >= deadline:
+                if other or self.buffer:
+                    return "TIMEOUT_WITH_DATA", " | ".join(other)
 
-    lines = [line.strip() for line in buffer.splitlines() if line.strip()]
+                return "TIMEOUT_EMPTY", ""
 
-    if buffer:
-        return lines, buffer, "TIMEOUT_WITH_DATA"
-
-    return lines, buffer, "TIMEOUT_EMPTY"
+            time.sleep(0.005)
 
 
-def send_command_sequence(port, baud, commands, delay, wait_for_reply, timeout_per_command):
+def send_command_sequence(port, baud, commands, delay, wait_for_reply,
+                          timeout_per_command, max_in_flight):
+    """
+    Streams commands with bounded look-ahead.
+
+    The firmware queues three commands and stops reading serial entirely while a
+    move runs, because processSerial() only runs from loop() and the move blocks
+    it. Sending faster than it acknowledges backs data up into the USB buffer
+    until a host write blocks, which used to surface as a fatal write timeout a
+    few dozen commands into a long program. Capping unacknowledged commands
+    keeps the pipe within what the firmware can hold, while still staging the
+    next move so it starts without waiting for a round trip.
+    """
     import serial
 
     sent = []
-    replies = []
-    raw = []
-    parsed = []
-
     failed = -1
     failure_reason = ""
+    results = {}
+
+    # Replies always have to be read, because they are the only signal that a
+    # queue slot has freed. WaitForReply therefore selects strict
+    # call-and-response rather than whether replies are read at all; letting
+    # commands fly unacknowledged is what overruns the controller.
+    if wait_for_reply:
+        window = 1
+    else:
+        window = clamp(int(max_in_flight), 1, FIRMWARE_QUEUE_DEPTH - 1)
 
     ser = serial.Serial(
         port=port,
         baudrate=baud,
         timeout=0.1,
-        write_timeout=2.0
+        # A full device buffer is normal backpressure, not an error, so this is
+        # generous. The window above should keep it from ever being reached;
+        # pyserial may write partially before raising, so a timeout here cannot
+        # be safely retried and is reported instead.
+        write_timeout=max(30.0, timeout_per_command)
     )
 
     # Give Teensy serial connection time to settle.
@@ -551,73 +645,111 @@ def send_command_sequence(port, baud, commands, delay, wait_for_reply, timeout_p
     except Exception:
         pass
 
-    for i, command in enumerate(commands):
-        ok, message = validate_rj_command(command)
+    stream = ReplyStream(ser)
+    pending = []
 
-        if not ok:
-            failed = i
-            failure_reason = "Invalid command at index {}: {}".format(i, message)
-            break
+    def record(index, status_code, line):
+        state = parse_rp_line(line if status_code == REPLY_RP else "")
+        state["command_index"] = index
+        state["reply_status"] = status_code
+        state["reply_line"] = line
+        results[index] = state
 
-        wire_command = command.strip() + "\n"
+    def collect_one():
+        """
+        Resolve the oldest unacknowledged command.
 
-        try:
-            ser.write(wire_command.encode("utf-8"))
-            ser.flush()
+        Returns (index, ok, reason) so the caller can blame the command that
+        actually failed rather than whatever is next in the queue.
+        """
+        index = pending.pop(0)
+        status_code, line = stream.next_ack(timeout_per_command)
+        record(index, status_code, line)
 
-        except Exception as e:
-            failed = i
-            failure_reason = "Serial write failed at index {}: {}".format(i, e)
-            break
-
-        sent.append(command.strip())
-
-        if wait_for_reply:
-            lines, buffer, reply_status = read_reply_for_command(
-                ser,
-                timeout_per_command,
-                wait_for_rp=True
+        if status_code in (REPLY_ERROR_ER, REPLY_ERROR_EL):
+            return index, False, "Firmware returned {} at command index {}.".format(
+                status_code,
+                index
             )
 
-            replies.append(lines)
-            raw.append(buffer)
+        if status_code.startswith("TIMEOUT"):
+            return index, False, (
+                "No reply to command index {} within {:.0f}s. Raise "
+                "TimeoutPerCommand above the longest single move."
+            ).format(index, timeout_per_command)
 
-            rp_line = clean_rp_reply(buffer)
-            state = parse_rp_line(rp_line)
-
-            state["command_index"] = i
-            state["reply_status"] = reply_status
-            parsed.append(state)
-
-            if reply_status in ["ERROR_ER", "ERROR_EL"]:
-                failed = i
-                failure_reason = "Firmware returned {} at command index {}.".format(
-                    reply_status,
-                    i
-                )
-                break
-
-            if reply_status in ["TIMEOUT_EMPTY", "TIMEOUT_WITH_DATA"]:
-                failed = i
-                failure_reason = "Timed out waiting for reply at command index {}.".format(i)
-                break
-
-        else:
-            replies.append([])
-            raw.append("")
-            parsed.append({
-                "parsed": False,
-                "command_index": i,
-                "reply_status": "NOT_WAITING"
-            })
-
-        if delay > 0.0:
-            time.sleep(delay)
+        return index, True, ""
 
     try:
-        ser.close()
-    except Exception:
-        pass
+        for i, command in enumerate(commands):
+            ok, message = validate_rj_command(command)
+
+            if not ok:
+                failed = i
+                failure_reason = "Invalid command at index {}: {}".format(i, message)
+                break
+
+            while len(pending) >= window:
+                index, ok, message = collect_one()
+
+                if not ok:
+                    failed = index
+                    failure_reason = message
+                    break
+
+            if failure_reason:
+                break
+
+            try:
+                ser.write((command.strip() + "\n").encode("utf-8"))
+                ser.flush()
+
+            except Exception as e:
+                failed = i
+                failure_reason = (
+                    "Serial write failed at index {}: {}. The controller stopped "
+                    "accepting data; check that it is still powered and running."
+                ).format(i, e)
+                break
+
+            sent.append(command.strip())
+            pending.append(i)
+
+            if delay > 0.0:
+                time.sleep(delay)
+
+        # Let the moves already accepted by the controller finish.
+        while pending and not failure_reason:
+            index, ok, message = collect_one()
+
+            if not ok:
+                failed = index
+                failure_reason = message
+
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    replies = []
+    raw = []
+    parsed = []
+
+    for i in range(len(sent)):
+        state = results.get(i)
+
+        if state is None:
+            state = {
+                "parsed": False,
+                "command_index": i,
+                "reply_status": "NOT_COLLECTED"
+            }
+
+        line = state.get("reply_line", "")
+        replies.append([line] if line else [])
+        raw.append(line)
+        parsed.append(state)
 
     return sent, replies, raw, parsed, failed, failure_reason
 
@@ -663,9 +795,14 @@ try:
     run = to_bool(Run, False)
     stop = to_bool(Stop, False)
 
-    delay = to_float(Delay, 0.25)
-    wait_for_reply = to_bool(WaitForReply, True)
-    timeout_per_command = to_float(TimeoutPerCommand, 30.0)
+    delay = to_float(Delay, 0.0)
+    wait_for_reply = to_bool(WaitForReply, False)
+
+    # Must exceed the longest single move in the program, because the firmware
+    # only replies once that move has finished. A slow traverse of the full
+    # track is minutes, so the old 30s default aborted mid-program.
+    timeout_per_command = to_float(TimeoutPerCommand, 300.0)
+    max_in_flight = int(to_float(get_optional_input("MaxInFlight", 2), 2))
 
     if delay < 0.0:
         delay = 0.0
@@ -784,7 +921,8 @@ try:
                     commands=send_commands,
                     delay=delay,
                     wait_for_reply=wait_for_reply,
-                    timeout_per_command=timeout_per_command
+                    timeout_per_command=timeout_per_command,
+                    max_in_flight=max_in_flight
                 )
 
                 if raw_replies:
