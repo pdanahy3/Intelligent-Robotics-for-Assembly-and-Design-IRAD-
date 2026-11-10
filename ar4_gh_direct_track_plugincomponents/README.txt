@@ -1,54 +1,112 @@
 AR4 Grasshopper Python component replacements
+=============================================
 
-Replace each GhPython component script with the matching .py file:
+Replace each Grasshopper Python 3 component script with the matching .py file.
+Full documentation is in ../README.md; this file is the quick reference.
+
+Components communicate through scriptcontext.sticky, so component 1 must run
+first to seed the shared defaults.
+
 
 01_startup_connection.py
-  Inputs:  Load, Reload, URDF, PackageRoot, PreferredPort, Baud, TestCommand, Connect
-  Outputs: cache_id, robot_model, robot_name, joint_names, motion_joint_names, link_names, mesh_link_names, mesh_count, available_ports, active_port, handshake_reply, startup_state, status
+  Wired:    Load, Reload, URDF, PackageRoot, PreferredPort, Baud, TestCommand,
+            Connect
+  Optional: BasePlane, ToolMeshes, ToolTCPPlane, ToolTCPPoint
+  Outputs:  cache_id, robot_model, robot_name, joint_names, motion_joint_names,
+            link_names, mesh_link_names, mesh_count, available_ports,
+            active_port, handshake_reply, base_plane, tool_meshes,
+            tool_tcp_plane, startup_state, status
+  ToolMeshes is a Mesh parameter, List access. Breps are meshed on the way in.
 
 02_calibration.py
-  Inputs:  Port, Baud, Mode, J1, J2, J3, J4, J5, J6, J7, J8, J9, Run, Timeout
-  Outputs: sent_command, reply_lines, raw_reply, joint_values_deg, joint_values_rad, cartesian_pose, external_axes_mm, j7_mm, track_m, calibration_state, status
-  Modes: RP, TL, LL, Z7
+  Wired:    Port, Baud, Mode, J1..J9, Run, Timeout
+  Outputs:  sent_command, reply_lines, raw_reply, joint_values_deg,
+            joint_values_rad, cartesian_pose, external_axes_mm, j7_mm, track_m,
+            calibration_state, status
+  Modes:    RP, TL, LL, Z7
 
 03_program_ik_planner.py
-  Inputs:  cache_id, Targets, ToolZ, Speed, Accel, Decel, Ramp, Wrist, UseTrack, Solve
-  Outputs: solved, program_joint_values_rad, program_joint_values_deg, program_track_m, program_j7_mm, rj_commands, ik_errors, target_planes_robot, tcp_planes_solved, program_state, status
-  Fixes: TrackM convention 0=motor side / 1=far end; split J7-only commands at 100%; 5-minute timeout.
+  Wired:    Targets, Speed, Accel, Decel, Ramp, Wrist, UseTrack, Solve
+  Optional: TCPPlane, TCPPoint, UseCalibratedTCP, PosTolMM, RotTolDeg,
+            RotationWeight, MaxSeeds, MaxSolveSeconds, BasePlane, TargetUnitsMM,
+            SplitTrackMotion, TrackSpeedPercent, TrackLengthMM,
+            TrackRailLengthMM, TrackMoveEpsilonMM, TrackFirmwareInverted,
+            HomeJointsDeg, JointSigns, UseCalibrationFrame, ToolZ (legacy)
+  Outputs:  solved, program_joint_values_rad, program_joint_values_deg,
+            program_track_m, program_j7_mm, rj_commands, ik_errors,
+            tcp_pos_error_mm, tcp_rot_error_deg, target_planes_robot,
+            tcp_planes_solved, program_state, status
+  Speed is percent of max step rate (Sp), 1-100, default 25.
 
 04_simulation_visualization.py
-  Inputs:  Commands, Time, DrawRobot, DrawTrack, DrawPath, DrawTargets, DrawSkeleton
-  Outputs: active_index, active_command, active_joint_values_deg, active_joint_values_rad, active_track_m, active_j7_mm, robot_geometry, track_geometry, tcp_planes, tcp_path, target_geometry, skeleton_lines, simulation_state, status
+  No serial. No Port/Baud inputs.
+  Optional: Commands, Time, DrawRobot, DrawTrack, DrawPath, DrawTargets,
+            DrawSkeleton, HideGripper, ToolMeshes, TCPPlane, TCPPoint,
+            BasePlane, TrackLengthMM, TrackRailLengthMM,
+            TrackFirmwareInverted, HomeJointsDeg, JointSigns, ToolZ
+  Outputs:  active_index, active_command, active_joint_values_deg,
+            active_joint_values_rad, active_track_m, active_j7_mm,
+            robot_geometry, tool_geometry, track_geometry, tcp_planes, tcp_path,
+            target_geometry, skeleton_lines, simulation_state, status
+  The URDF gripper hides automatically when any tool mesh is present.
 
 05_run_serial_sender.py
-  Inputs:  Port, Baud, Commands, Run, Stop, Delay, WaitForReply, TimeoutPerCommand
-  Outputs: sent_commands, reply_lines, raw_replies, parsed_states, last_reply, last_rp_state, run_index, completed, failed_index, status
+  Wired:    Port, Baud, Commands, Run, Stop, Delay, WaitForReply,
+            TimeoutPerCommand
+  Optional: MaxInFlight, EncodeFirmwareOnSend, HomeJointsDeg, JointSigns
+  Outputs:  sent_commands, reply_lines, raw_replies, parsed_states, last_reply,
+            last_rp_state, run_index, completed, failed_index, status
+  Run is edge-triggered: toggle False then True to send again.
+  MaxInFlight caps unacknowledged commands at 2, one below the controller's
+  three-deep queue. TimeoutPerCommand must exceed the longest single move.
 
-06_teach_pose_calibration.py
-  Inputs:  Port, Baud, Action, Run, Timeout, TrackLengthMM
-  Outputs: sent_command, reply_lines, raw_reply, current_joints_deg, current_j7,
-           pose_a_joints_deg, pose_a_j7, pose_b_joints_deg, pose_b_j7,
-           joint_offsets_deg, j7_offset, j7_span, j7_sign, j7_scale,
-           recommended_home_deg, recommended_track_length_mm, track_firmware_inverted,
-           calibration_report, teach_state, status
-  Actions: READ, TEACH_A, TEACH_B, COMPUTE, CLEAR
-  Pose A expected: all joints 0, J7=0
-  Pose B expected: arm joints 0, J7=TrackLengthMM (1000)
-  Writes sticky: AR4_HOME_URDF_DEG, AR4_TRACK_LENGTH_MM, AR4_TRACK_FIRMWARE_INVERTED
+06_jog_control.py
+  Optional: J1..J6, TrackM, Send, Capture, CaptureLabel, ClearCaptures, Port,
+            Baud, Speed, SpeedType, Accel, Decel, Ramp, Wrist, SendTimeout,
+            DrawRobot, DrawTrack, DrawSkeleton, HideGripper, ToolMeshes,
+            TCPPlane, TCPPoint, BasePlane, TrackLengthMM, TrackRailLengthMM,
+            TrackFirmwareInverted, HomeJointsDeg, JointSigns, ToolZ,
+            EncodeFirmwareOnSend
+  Outputs:  robot_geometry, tool_geometry, track_geometry, skeleton_lines,
+            flange_plane, tcp_plane, rj_command, captures, capture_count,
+            capture_labels, jog_state, status
+  Send is edge-triggered, so unrelated slider moves do not re-fire it.
 
-Track convention in all rewritten components (simulation is source of truth):
+07_tcp_calibration.py
+  Optional: Captures (No Type Hint, List access), Solve, Apply, Clear,
+            MaxAxisTiltDeg
+  Outputs:  tcp_frame, tcp_plane_local, tcp_offset_mm, fit_max_mm, fit_rms_mm,
+            calibration_point, warnings, status
+  Capture labels: tip* (4 or more, one physical point from different
+  orientations), axisx* and axisz* (translation-only moves), ref* (reference
+  orientation). Writes sticky AR4_TCP_FRAME.
+
+
+Track convention (the simulation is the source of truth)
+--------------------------------------------------------
   TrackM = 0.0 -> motor / limit-switch side -> firmware J7 = 0
-  TrackM = 1.0 -> far end                  -> firmware J7 = TrackLengthMM (1000 for 1 m)
+  TrackM = 1.0 -> far end                   -> firmware J7 = TrackLengthMM
   J7 = TrackM * TrackLengthMM
-  Firmware MotDir/CalDir/length should be set so RP matches the simulation.
-  TrackFirmwareInverted is only a temporary bridge if firmware is still opposite the sim.
-  Set Teensy J7axisLimPos / HMI CE length to 1000 for a 1 m track (not 3450/6000).
+  Usable travel 870 mm on a 1000 mm rail.
+  Set Teensy J7axisLimPos and the HMI length to 1000 for a 1 m track,
+  not 3450 or 6000. TrackFirmwareInverted is only a bridge if the firmware is
+  still opposite the simulation.
 
-Suggested workflow:
-  1. Startup: Load=True, Reload=True once.
-  2. Calibration: use your normal LL or RP modes after fixing calibration direction in firmware.
-  3. Teach poses (06): TEACH_A at visual zero / J7 home, TEACH_B at visual zero / J7 far.
-  4. Use calibration_report offsets for J1 zero error and J7 scale/sign.
-  5. Program: Solve=False, set targets; then Solve=True once.
-  6. Simulation: Connect Program rj_commands.
-  6. Run: Connect Program rj_commands, then toggle Run False->True.
+
+Joint frame mapping
+-------------------
+  firmware = (urdf - HomeJointsDeg) * JointSigns
+  HomeJointsDeg = [-16, 0, 0, 0, 22, -10]
+  JointSigns    = [-1, 1, 1, 1, 1, 1]
+  Flipping JointSigns[0] requires flipping HomeJointsDeg[0] with it.
+
+
+Workflow
+--------
+  1. Startup (01): Load=True, Reload=True once.
+  2. Calibration (02): RP or LL as needed.
+  3. Jog (06): drive to a known pose; Capture labelled poses for TCP work.
+  4. TCP calibration (07): Solve, then Apply to publish the frame.
+  5. Program (03): set Targets with Solve=False, then Solve=True once.
+  6. Simulation (04): connect the Program rj_commands output.
+  7. Run (05): connect rj_commands, then toggle Run False -> True.
