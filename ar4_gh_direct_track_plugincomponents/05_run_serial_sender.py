@@ -1,10 +1,50 @@
 #! python3
 # r: pyserial
+# r: compas
+# r: compas_robots
+
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   Commands
+#   Run
+#   Stop
+#   Delay
+#   WaitForReply
+#   TimeoutPerCommand
+#   MaxInFlight
+#   EncodeFirmwareOnSend
+#   HomeJointsDeg
+#   JointSigns
+#   DrawRobot
+# OUTPUTS:
+#   sent_commands
+#   reply_lines
+#   raw_replies
+#   parsed_states
+#   last_reply
+#   last_rp_state
+#   run_index
+#   completed
+#   failed_index
+#   live_joint_values_deg
+#   live_track_m
+#   live_j7_mm
+#   flange_plane
+#   tcp_plane
+#   robot_geometry
+#   tool_geometry
+#   status
+# =============================================================================
 
 """
 AR4 + External Track — Component 5: Run / Serial Sender
 
-Accepts program/sim RJ commands (URDF joint degrees in A..F).
+Accepts program/sim RJ commands (URDF joint degrees in A..F) and streams them
+through Comp1's open SerialBus (sticky AR4_SERIAL_BUS). This component does
+not open or close the COM port — leave Comp1 Connect=True.
+
 Before serial send, optionally encodes A..F to firmware degrees:
 
     firmware = (urdf - HomeJointsDeg) * JointSigns
@@ -43,19 +83,35 @@ write blocks, which appeared as a stall partway through long programs. This
 component never leaves more than MaxInFlight commands unacknowledged, so the
 controller's queue absorbs the look-ahead and writes never block.
 
+Non-blocking GH solves
+----------------------
+Each solve only polls the SerialBus ack queue (no multi-second wait, no
+time.sleep). If a move is still running, Comp5 schedules another solve in
+~40 ms via GH ScheduleSolution so the canvas, Comp1 live pose, and preview
+keep updating. TimeoutPerCommand is enforced with timestamps, not by parking
+the solve thread.
+
 Note that each RJ command accelerates from and decelerates to a full stop, so
 a long point sequence moves in discrete steps regardless of pacing. Continuous
 velocity needs the firmware's spline mode (SL / MS / SS), which acknowledges
-on receipt rather than on completion.
+on receipt rather than on completion. Mid-move joint streaming still depends
+on the firmware emitting RP while moving; between moves the preview updates
+from each RP as soon as it arrives.
 """
 
 import time
 import math
 
+import Rhino.Geometry as rg
+
 try:
     import scriptcontext as sc
 except Exception:
     sc = None
+
+# ghenv is injected by the Grasshopper Python Script host when available.
+if "ghenv" not in globals():
+    ghenv = None
 
 
 # ------------------------------------------------------------
@@ -525,233 +581,357 @@ def is_rp_line(line):
     return line.startswith("A") and "B" in line and "C" in line and "P" in line
 
 
-class ReplyStream:
-    """
-    Rolling line reader over one open port.
-
-    The previous reader rebuilt its buffer per command, so any bytes it pulled
-    past the end of one reply were dropped, and anything the firmware emitted
-    between replies could shift the stream permanently out of step with the
-    commands. One buffer for the whole run keeps acknowledgements aligned with
-    the commands that caused them.
-    """
-
-    def __init__(self, ser):
-        self.ser = ser
-        self.buffer = ""
-        self.seen = []
-
-    def pump(self):
-        """Move available bytes into completed lines. Returns the new lines."""
-        fresh = []
-
-        try:
-            waiting = self.ser.in_waiting
-        except Exception:
-            waiting = 0
-
-        if waiting > 0:
-            data = self.ser.read(waiting)
-            self.buffer += data.decode("utf-8", errors="ignore")
-
-            while "\n" in self.buffer:
-                line, self.buffer = self.buffer.split("\n", 1)
-                line = line.strip()
-
-                if line:
-                    fresh.append(line)
-                    self.seen.append(line)
-
-        return fresh
-
-    def next_ack(self, timeout):
-        """
-        Wait for one terminal reply: an RP position line, ER, or EL.
-
-        Returns (status, line). Lines the firmware prints that are not terminal
-        replies are collected but do not end the wait.
-        """
-        deadline = time.time() + timeout
-        other = []
-
-        while True:
-            for line in self.pump():
-                if line == "ER":
-                    return REPLY_ERROR_ER, line
-
-                if line.startswith("EL"):
-                    return REPLY_ERROR_EL, line
-
-                if is_rp_line(line):
-                    return REPLY_RP, line
-
-                other.append(line)
-
-            if time.time() >= deadline:
-                if other or self.buffer:
-                    return "TIMEOUT_WITH_DATA", " | ".join(other)
-
-                return "TIMEOUT_EMPTY", ""
-
-            time.sleep(0.005)
+SERIAL_BUS_KEY = "AR4_SERIAL_BUS"
 
 
-def send_command_sequence(port, baud, commands, delay, wait_for_reply,
-                          timeout_per_command, max_in_flight):
-    """
-    Streams commands with bounded look-ahead.
-
-    The firmware queues three commands and stops reading serial entirely while a
-    move runs, because processSerial() only runs from loop() and the move blocks
-    it. Sending faster than it acknowledges backs data up into the USB buffer
-    until a host write blocks, which used to surface as a fatal write timeout a
-    few dozen commands into a long program. Capping unacknowledged commands
-    keeps the pipe within what the firmware can hold, while still staging the
-    next move so it starts without waiting for a round trip.
-    """
-    import serial
-
-    sent = []
-    failed = -1
-    failure_reason = ""
-    results = {}
-
-    # Replies always have to be read, because they are the only signal that a
-    # queue slot has freed. WaitForReply therefore selects strict
-    # call-and-response rather than whether replies are read at all; letting
-    # commands fly unacknowledged is what overruns the controller.
-    if wait_for_reply:
-        window = 1
-    else:
-        window = clamp(int(max_in_flight), 1, FIRMWARE_QUEUE_DEPTH - 1)
-
-    ser = serial.Serial(
-        port=port,
-        baudrate=baud,
-        timeout=0.1,
-        # A full device buffer is normal backpressure, not an error, so this is
-        # generous. The window above should keep it from ever being reached;
-        # pyserial may write partially before raising, so a timeout here cannot
-        # be safely retried and is reported instead.
-        write_timeout=max(30.0, timeout_per_command)
-    )
-
-    # Give Teensy serial connection time to settle.
-    time.sleep(2.0)
-
+def get_connected_bus():
+    if sc is None:
+        return None
+    bus = sc.sticky.get(SERIAL_BUS_KEY)
+    if bus is None:
+        return None
     try:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+        if bus.is_connected():
+            return bus
     except Exception:
-        pass
+        return None
+    return None
 
-    stream = ReplyStream(ser)
-    pending = []
 
-    def record(index, status_code, line):
-        state = parse_rp_line(line if status_code == REPLY_RP else "")
-        state["command_index"] = index
-        state["reply_status"] = status_code
-        state["reply_line"] = line
-        results[index] = state
+RUN_QUEUE_KEY = "AR4_RUN_QUEUE_STATE"
+LIVE_POSE_KEY = "AR4_LIVE_POSE"
 
-    def collect_one():
-        """
-        Resolve the oldest unacknowledged command.
 
-        Returns (index, ok, reason) so the caller can blame the command that
-        actually failed rather than whatever is next in the queue.
-        """
-        index = pending.pop(0)
-        status_code, line = stream.next_ack(timeout_per_command)
-        record(index, status_code, line)
+def request_another_solve(delay_ms=40):
+    """
+    Schedule a later re-solve so streaming does not freeze the canvas.
 
-        if status_code in (REPLY_ERROR_ER, REPLY_ERROR_EL):
-            return index, False, "Firmware returned {} at command index {}.".format(
-                status_code,
-                index
-            )
-
-        if status_code.startswith("TIMEOUT"):
-            return index, False, (
-                "No reply to command index {} within {:.0f}s. Raise "
-                "TimeoutPerCommand above the longest single move."
-            ).format(index, timeout_per_command)
-
-        return index, True, ""
-
+    ExpireSolution(True) from inside SolveInstance can re-enter immediately and
+    still feels blocked if the previous solve waited on serial. ScheduleSolution
+    yields back to Rhino first.
+    """
     try:
-        for i, command in enumerate(commands):
-            ok, message = validate_rj_command(command)
+        if ghenv is None or not hasattr(ghenv, "Component"):
+            return
+        comp = ghenv.Component
+        doc = comp.OnPingDocument()
+        if doc is None:
+            comp.ExpireSolution(True)
+            return
 
-            if not ok:
-                failed = i
-                failure_reason = "Invalid command at index {}: {}".format(i, message)
-                break
-
-            while len(pending) >= window:
-                index, ok, message = collect_one()
-
-                if not ok:
-                    failed = index
-                    failure_reason = message
-                    break
-
-            if failure_reason:
-                break
-
+        def _cb(gh_doc):
             try:
-                ser.write((command.strip() + "\n").encode("utf-8"))
-                ser.flush()
+                if comp is not None:
+                    comp.ExpireSolution(False)
+            except Exception:
+                pass
 
-            except Exception as e:
-                failed = i
-                failure_reason = (
-                    "Serial write failed at index {}: {}. The controller stopped "
-                    "accepting data; check that it is still powered and running."
-                ).format(i, e)
-                break
-
-            sent.append(command.strip())
-            pending.append(i)
-
-            if delay > 0.0:
-                time.sleep(delay)
-
-        # Let the moves already accepted by the controller finish.
-        while pending and not failure_reason:
-            index, ok, message = collect_one()
-
-            if not ok:
-                failed = index
-                failure_reason = message
-
-    finally:
+        doc.ScheduleSolution(max(1, int(delay_ms)), _cb)
+    except Exception:
         try:
-            ser.close()
+            if ghenv is not None:
+                ghenv.Component.ExpireSolution(True)
         except Exception:
             pass
 
-    replies = []
-    raw = []
-    parsed = []
 
-    for i in range(len(sent)):
-        state = results.get(i)
+def publish_live_pose(joints_deg, track_m, j7_mm, reply_line=""):
+    pose = {
+        "joint_values_deg": list(joints_deg[:6]) if joints_deg else [],
+        "track_m": float(track_m),
+        "j7_mm": float(j7_mm),
+        "raw": reply_line or "",
+        "time": time.time(),
+    }
+    if sc is not None:
+        sc.sticky[LIVE_POSE_KEY] = pose
+    return pose
 
-        if state is None:
-            state = {
-                "parsed": False,
-                "command_index": i,
-                "reply_status": "NOT_COLLECTED"
-            }
 
-        line = state.get("reply_line", "")
-        replies.append([line] if line else [])
-        raw.append(line)
-        parsed.append(state)
+def find_startup_cache():
+    if sc is None:
+        return None, None, {}
+    best = None
+    for key in sc.sticky.keys():
+        if not str(key).endswith("::startup_state"):
+            continue
+        state = sc.sticky.get(key)
+        if isinstance(state, dict):
+            best = state
+    if not best:
+        return None, None, {}
+    cache_id = best.get("cache_id")
+    model = sc.sticky.get("{}::model".format(cache_id)) if cache_id else None
+    meshes = sc.sticky.get("{}::meshes".format(cache_id), {}) if cache_id else {}
+    return cache_id, model, meshes if isinstance(meshes, dict) else {}
 
-    return sent, replies, raw, parsed, failed, failure_reason
+
+def resolve_tcp_local():
+    if sc is None:
+        return rg.Plane.WorldXY
+    for key in ("AR4_TCP_FRAME", "AR4_TOOL_TCP_FRAME"):
+        d = sc.sticky.get(key)
+        if isinstance(d, dict) and "origin_m" in d:
+            o = d["origin_m"]
+            return rg.Plane(
+                rg.Point3d(o[0], o[1], o[2]),
+                rg.Vector3d(*d.get("xaxis", [1, 0, 0])),
+                rg.Vector3d(*d.get("yaxis", [0, 1, 0])),
+            )
+    return rg.Plane.WorldXY
+
+
+def build_live_geometry(joints_deg, track_m):
+    """FK + meshes for GH preview from a live joint pose."""
+    out = {
+        "flange_plane": rg.Plane.Unset,
+        "tcp_plane": rg.Plane.Unset,
+        "robot_geometry": [],
+        "tool_geometry": [],
+    }
+    cache_id, model, mesh_cache = find_startup_cache()
+    if model is None:
+        return out
+
+    travel = 870.0
+    rail = 1000.0
+    if sc is not None:
+        travel = to_float(sc.sticky.get("AR4_TRACK_LENGTH_MM", 870.0), 870.0)
+        rail = to_float(sc.sticky.get("AR4_TRACK_RAIL_LENGTH_MM", 1000.0), 1000.0)
+
+    try:
+        config = model.zero_configuration()
+        names = model.get_configurable_joint_names()
+    except Exception:
+        return out
+
+    track_urdf = clamp(track_m, 0.0, 1.0) * (travel / rail if rail > 1e-9 else 0.0)
+    if "track_joint" in names:
+        config["track_joint"] = track_urdf
+    for i in range(6):
+        n = "joint_{}".format(i + 1)
+        if n in names and i < len(joints_deg):
+            config[n] = math.radians(joints_deg[i])
+
+    display_scale = 1000.0
+    tool_link = None
+    try:
+        link_names = [lnk.name for lnk in model.links]
+    except Exception:
+        link_names = []
+    for name in ["tool0", "ee_link", "link_6", "pneumatic_gripper_tool_link"]:
+        if name in link_names:
+            tool_link = name
+            break
+    if tool_link is None and link_names:
+        tool_link = link_names[-1]
+
+    # Base plane
+    base = rg.Plane.WorldXY
+    if sc is not None and cache_id:
+        bp = sc.sticky.get(cache_id + "::base_plane", None)
+        if isinstance(bp, rg.Plane) and bp.IsValid:
+            base = bp
+
+    def to_world(plane):
+        p = rg.Plane(plane)
+        p.Transform(rg.Transform.PlaneToPlane(rg.Plane.WorldXY, base))
+        return p
+
+    frames = {}
+    for name in link_names:
+        try:
+            fr = model.forward_kinematics(config, link_name=name)
+            p = fr.point
+            frames[name] = rg.Plane(
+                rg.Point3d(float(p.x) * display_scale, float(p.y) * display_scale, float(p.z) * display_scale),
+                rg.Vector3d(float(fr.xaxis.x), float(fr.xaxis.y), float(fr.xaxis.z)),
+                rg.Vector3d(float(fr.yaxis.x), float(fr.yaxis.y), float(fr.yaxis.z)),
+            )
+        except Exception:
+            pass
+
+    flange = frames.get(tool_link)
+    if flange is None:
+        return out
+
+    out["flange_plane"] = to_world(flange)
+    tcp_local = resolve_tcp_local()
+    tcp = rg.Plane(tcp_local)
+    tcp.Origin = rg.Point3d(
+        tcp.Origin.X * display_scale,
+        tcp.Origin.Y * display_scale,
+        tcp.Origin.Z * display_scale,
+    )
+    tcp.Transform(rg.Transform.PlaneToPlane(rg.Plane.WorldXY, flange))
+    out["tcp_plane"] = to_world(tcp)
+
+    scale_local = rg.Transform.Scale(rg.Point3d(0, 0, 0), display_scale)
+    gripper = set(("gripper_base_link", "gripper_jaw1_link", "gripper_jaw2_link"))
+    tool_meshes = []
+    if sc is not None:
+        tm = sc.sticky.get("AR4_TOOL_MESHES", None)
+        if isinstance(tm, list):
+            tool_meshes = tm
+    hide_gripper = bool(tool_meshes)
+
+    for link_name, local_meshes in mesh_cache.items():
+        if link_name not in frames:
+            continue
+        if hide_gripper and link_name in gripper:
+            continue
+        xform = rg.Transform.PlaneToPlane(rg.Plane.WorldXY, to_world(frames[link_name]))
+        for base_mesh in local_meshes:
+            moved = base_mesh.DuplicateMesh()
+            moved.Transform(scale_local)
+            moved.Transform(xform)
+            out["robot_geometry"].append(moved)
+
+    if tool_meshes:
+        xform = rg.Transform.PlaneToPlane(rg.Plane.WorldXY, out["flange_plane"])
+        for base_mesh in tool_meshes:
+            moved = base_mesh.DuplicateMesh()
+            moved.Transform(xform)
+            out["tool_geometry"].append(moved)
+
+    return out
+
+
+def pump_run_queue(bus, wait_for_reply, timeout_per_command, max_in_flight, delay):
+    """
+    Non-blocking queue pump for one GH solve.
+
+    Sends up to the look-ahead window, drains any acks already in the SerialBus
+    queue, and returns immediately if the robot is still moving. Real command
+    timeouts use pending_sent_at timestamps — the solve thread never sleeps for
+    TimeoutPerCommand.
+    """
+    state = sc.sticky.get(RUN_QUEUE_KEY)
+    if not isinstance(state, dict) or not state.get("active"):
+        return state, "No active run queue."
+
+    commands = state.get("encoded_commands") or []
+    pending = list(state.get("pending") or [])
+    pending_sent_at = dict(state.get("pending_sent_at") or {})
+    next_i = int(state.get("next_index", 0))
+    results = dict(state.get("results") or {})
+    sent = list(state.get("sent_commands") or [])
+    window = 1 if wait_for_reply else clamp(int(max_in_flight), 1, FIRMWARE_QUEUE_DEPTH - 1)
+    now = time.time()
+    next_send_after = float(state.get("next_send_after", 0.0) or 0.0)
+
+    def record(index, status_code, line):
+        st = parse_rp_line(line if status_code in (REPLY_RP, "RP") else "")
+        st["command_index"] = index
+        st["reply_status"] = status_code if status_code != "RP" else REPLY_RP
+        st["reply_line"] = line
+        results[index] = st
+        if st.get("parsed"):
+            publish_live_pose(
+                st.get("joint_values_deg") or [],
+                st.get("track_m") or 0.0,
+                st.get("j7_mm") or 0.0,
+                line
+            )
+
+    # Fill the look-ahead window without sleeping on Delay.
+    while (
+        state.get("active", True)
+        and len(pending) < window
+        and next_i < len(commands)
+        and now >= next_send_after
+    ):
+        cmd = commands[next_i]
+        ok, message = validate_rj_command(cmd)
+        if not ok:
+            state["active"] = False
+            state["failed_index"] = next_i
+            state["failure_reason"] = message
+            state["completed"] = False
+            break
+        try:
+            bus.write_command(cmd)
+        except Exception as e:
+            state["active"] = False
+            state["failed_index"] = next_i
+            state["failure_reason"] = str(e)
+            state["completed"] = False
+            break
+        sent.append(cmd.strip())
+        pending.append(next_i)
+        pending_sent_at[next_i] = now
+        next_i += 1
+        if delay > 0.0:
+            next_send_after = now + delay
+            break
+
+    # Drain every ack that is already buffered. Never wait for the move.
+    while pending and state.get("active", True):
+        if hasattr(bus, "poll_ack"):
+            status_code, line = bus.poll_ack(accept_any_line=False)
+        else:
+            status_code, line = bus.wait_ack(0.0, accept_any_line=False)
+
+        if str(status_code).startswith("TIMEOUT"):
+            oldest = pending[0]
+            age = now - float(pending_sent_at.get(oldest, now))
+            if age > float(timeout_per_command):
+                index = pending.pop(0)
+                pending_sent_at.pop(index, None)
+                record(index, status_code, line)
+                state["active"] = False
+                state["failed_index"] = index
+                state["failure_reason"] = "Command {} -> {} after {:.1f}s".format(
+                    index, status_code, age
+                )
+                state["completed"] = False
+            break
+
+        index = pending.pop(0)
+        pending_sent_at.pop(index, None)
+        if status_code == "RP":
+            status_code = REPLY_RP
+        record(index, status_code, line)
+        if status_code in (REPLY_ERROR_ER, REPLY_ERROR_EL):
+            state["active"] = False
+            state["failed_index"] = index
+            state["failure_reason"] = "Command {} -> {}".format(index, status_code)
+            state["completed"] = False
+            break
+
+    state["pending"] = pending
+    state["pending_sent_at"] = pending_sent_at
+    state["next_index"] = next_i
+    state["next_send_after"] = next_send_after
+    state["results"] = results
+    state["sent_commands"] = sent
+
+    if state.get("active") and next_i >= len(commands) and not pending:
+        state["active"] = False
+        state["completed"] = state.get("failed_index", -1) < 0
+        state["failure_reason"] = state.get("failure_reason", "")
+
+    sc.sticky[RUN_QUEUE_KEY] = state
+
+    if state.get("active"):
+        # Poll again soon; faster when an ack may already be inbound.
+        request_another_solve(25 if pending else 40)
+        oldest_age = 0.0
+        if pending:
+            oldest_age = now - float(pending_sent_at.get(pending[0], now))
+        msg = "Streaming {}/{} (in flight {}, oldest {:.1f}s).".format(
+            len(sent), len(commands), len(pending), oldest_age
+        )
+    elif state.get("completed"):
+        msg = "Run complete. Sent {} of {}.".format(len(sent), len(commands))
+    else:
+        msg = "Run stopped. Sent {} of {}. Failed {}. {}".format(
+            len(sent),
+            len(commands),
+            state.get("failed_index", -1),
+            state.get("failure_reason", ""),
+        )
+    return state, msg
 
 
 # ------------------------------------------------------------
@@ -767,6 +947,13 @@ last_rp_state = {}
 run_index = -1
 completed = False
 failed_index = -1
+live_joint_values_deg = []
+live_track_m = 0.0
+live_j7_mm = 0.0
+flange_plane = rg.Plane.Unset
+tcp_plane = rg.Plane.Unset
+robot_geometry = []
+tool_geometry = []
 status = ""
 
 
@@ -778,8 +965,9 @@ try:
     if sc is None:
         raise Exception("scriptcontext is not available.")
 
-    port = to_text(Port, "").strip()
-    baud = int(to_float(Baud, 9600))
+    bus = get_connected_bus()
+    port = getattr(bus, "port", "") if bus is not None else ""
+    baud = getattr(bus, "baud", 0) if bus is not None else 0
 
     commands = to_command_list(Commands)
     program_commands = list(commands)
@@ -824,7 +1012,12 @@ try:
         else "encode OFF (sending program RJ as-is)"
     )
 
+    queue_state = sc.sticky.get(RUN_QUEUE_KEY) if sc is not None else None
+
     if stop:
+        if isinstance(queue_state, dict):
+            queue_state["active"] = False
+            sc.sticky[RUN_QUEUE_KEY] = queue_state
         sc.sticky["AR4_RUN_LAST_STATE"] = {
             "sent_commands": [],
             "program_commands": [],
@@ -833,143 +1026,124 @@ try:
             "parsed_states": [],
             "completed": False,
             "failed_index": -1,
-            "status": "Stopped before run."
+            "status": "Stopped."
         }
+        status = "Stop=True. Run queue cleared."
 
-        status = "Stop=True. Nothing sent."
-
-    elif not port:
-        status = "No Port provided."
-
-    elif baud <= 0:
-        status = "Invalid Baud."
-
-    elif not program_commands:
-        status = "No RJ commands provided. Connect Program rj_commands to Commands."
+    elif bus is None:
+        status = "Serial bus not connected. Set Comp1 Connect=True and leave it on."
 
     else:
-        # Validate encoded commands that will actually go out on serial.
-        validation_errors = []
+        edge_key = "AR4_RUN_COMPONENT_LAST_RUN_STATE"
+        previous_run = sc.sticky.get(edge_key, False)
+        sc.sticky[edge_key] = run
 
-        for i, cmd in enumerate(send_commands):
-            ok, msg = validate_rj_command(cmd)
-
-            if not ok:
-                validation_errors.append("Index {}: {}".format(i, msg))
-
-        if validation_errors:
-            status = "Command validation failed. {}".format("; ".join(validation_errors[:3]))
-
-        else:
-            # Edge-trigger Run.
-            edge_key = "AR4_RUN_COMPONENT_LAST_RUN_STATE"
-            previous_run = sc.sticky.get(edge_key, False)
-
-            sc.sticky[edge_key] = run
-
-            last_state = sc.sticky.get("AR4_RUN_LAST_STATE", None)
-
-            if not run:
-                if isinstance(last_state, dict):
-                    sent_commands = last_state.get("sent_commands", [])
-                    reply_lines = last_state.get("reply_lines", [])
-                    raw_replies = last_state.get("raw_replies", [])
-                    parsed_states = last_state.get("parsed_states", [])
-                    completed = last_state.get("completed", False)
-                    failed_index = last_state.get("failed_index", -1)
-
-                    if raw_replies:
-                        last_reply = raw_replies[-1]
-
-                    if parsed_states:
-                        last_rp_state = parsed_states[-1]
-                        run_index = last_rp_state.get("command_index", -1)
-
-                    status = (
-                        "Run=False. Holding last run state. {} command(s) previously sent. {}."
-                    ).format(len(sent_commands), encode_note)
-                else:
-                    status = "Ready. {} command(s) loaded ({}). Toggle Run True to send.".format(
-                        len(program_commands),
-                        encode_note
-                    )
-
-            elif previous_run:
-                if isinstance(last_state, dict):
-                    sent_commands = last_state.get("sent_commands", [])
-                    reply_lines = last_state.get("reply_lines", [])
-                    raw_replies = last_state.get("raw_replies", [])
-                    parsed_states = last_state.get("parsed_states", [])
-                    completed = last_state.get("completed", False)
-                    failed_index = last_state.get("failed_index", -1)
-
-                    if raw_replies:
-                        last_reply = raw_replies[-1]
-
-                    if parsed_states:
-                        last_rp_state = parsed_states[-1]
-                        run_index = last_rp_state.get("command_index", -1)
-
-                    status = "Run is still True. Not resending. Toggle Run False, then True to run again."
-                else:
-                    status = "Run is True, but no previous run state exists. Toggle Run False, then True."
-
+        # Start a new streaming queue on Run False->True.
+        if run and not previous_run:
+            if not program_commands:
+                status = "No RJ commands provided."
             else:
-                sent_commands, reply_lines, raw_replies, parsed_states, failed_index, failure_reason = send_command_sequence(
-                    port=port,
-                    baud=baud,
-                    commands=send_commands,
-                    delay=delay,
-                    wait_for_reply=wait_for_reply,
-                    timeout_per_command=timeout_per_command,
-                    max_in_flight=max_in_flight
-                )
-
-                if raw_replies:
-                    last_reply = raw_replies[-1]
-
-                if parsed_states:
-                    last_rp_state = parsed_states[-1]
-                    run_index = last_rp_state.get("command_index", -1)
-
-                completed = failed_index < 0 and len(sent_commands) == len(send_commands)
-
-                run_state = {
-                    "sent_commands": sent_commands,
-                    "program_commands": program_commands,
-                    "encoded_commands": send_commands,
-                    "encode_firmware_on_send": encode_on_send,
-                    "home_urdf_deg": list(home_urdf_deg),
-                    "joint_signs": list(joint_signs),
-                    "encode_maps": encode_maps,
-                    "reply_lines": reply_lines,
-                    "raw_replies": raw_replies,
-                    "parsed_states": parsed_states,
-                    "last_reply": last_reply,
-                    "last_rp_state": last_rp_state,
-                    "run_index": run_index,
-                    "completed": completed,
-                    "failed_index": failed_index,
-                    "port": port,
-                    "baud": baud
-                }
-
-                sc.sticky["AR4_RUN_LAST_STATE"] = run_state
-
-                if completed:
-                    status = "Run complete. Sent {} of {} command(s) ({}).".format(
-                        len(sent_commands),
-                        len(send_commands),
-                        encode_note
+                validation_errors = []
+                for i, cmd in enumerate(send_commands):
+                    ok, msg = validate_rj_command(cmd)
+                    if not ok:
+                        validation_errors.append("Index {}: {}".format(i, msg))
+                if validation_errors:
+                    status = "Command validation failed. {}".format(
+                        "; ".join(validation_errors[:3])
                     )
                 else:
-                    status = "Run stopped/failure. Sent {} of {} command(s). Failed index: {}. {} ({})".format(
-                        len(sent_commands),
-                        len(send_commands),
-                        failed_index,
-                        failure_reason,
-                        encode_note
+                    bus.clear_acks()
+                    queue_state = {
+                        "active": True,
+                        "program_commands": program_commands,
+                        "encoded_commands": send_commands,
+                        "next_index": 0,
+                        "pending": [],
+                        "sent_commands": [],
+                        "results": {},
+                        "failed_index": -1,
+                        "failure_reason": "",
+                        "completed": False,
+                        "encode_note": encode_note,
+                        "port": port,
+                        "baud": baud,
+                    }
+                    sc.sticky[RUN_QUEUE_KEY] = queue_state
+                    status = "Run started ({} cmds, {}).".format(
+                        len(send_commands), encode_note
                     )
+
+        # Advance an active queue every solve (ExpireSolution keeps it moving).
+        queue_state = sc.sticky.get(RUN_QUEUE_KEY)
+        if isinstance(queue_state, dict) and queue_state.get("active"):
+            queue_state, status = pump_run_queue(
+                bus,
+                wait_for_reply,
+                timeout_per_command,
+                max_in_flight,
+                delay
+            )
+
+        # Mirror queue / last state into outputs.
+        if isinstance(queue_state, dict):
+            sent_commands = list(queue_state.get("sent_commands") or [])
+            results = queue_state.get("results") or {}
+            parsed_states = []
+            reply_lines = []
+            raw_replies = []
+            for i in range(len(sent_commands)):
+                st = results.get(i) or {
+                    "parsed": False,
+                    "command_index": i,
+                    "reply_status": "PENDING",
+                    "reply_line": "",
+                }
+                parsed_states.append(st)
+                line = st.get("reply_line", "")
+                reply_lines.append([line] if line else [])
+                raw_replies.append(line)
+            if raw_replies:
+                last_reply = raw_replies[-1]
+            if parsed_states:
+                last_rp_state = parsed_states[-1]
+                run_index = last_rp_state.get("command_index", -1)
+            completed = bool(queue_state.get("completed"))
+            failed_index = int(queue_state.get("failed_index", -1))
+            sc.sticky["AR4_RUN_LAST_STATE"] = {
+                "sent_commands": sent_commands,
+                "program_commands": queue_state.get("program_commands", []),
+                "encoded_commands": queue_state.get("encoded_commands", []),
+                "reply_lines": reply_lines,
+                "raw_replies": raw_replies,
+                "parsed_states": parsed_states,
+                "completed": completed,
+                "failed_index": failed_index,
+                "status": status,
+            }
+        elif not status:
+            status = "Ready. {} command(s) loaded ({}). Toggle Run True to stream.".format(
+                len(program_commands),
+                encode_note
+            )
+
+    # Live pose / geometry for GH preview (bus RP or last sticky pose).
+    pose = None
+    if bus is not None and hasattr(bus, "snapshot_pose"):
+        pose = bus.snapshot_pose()
+    if (not pose or not pose.get("parsed")) and sc is not None:
+        pose = sc.sticky.get(LIVE_POSE_KEY)
+
+    if isinstance(pose, dict) and (pose.get("parsed") or pose.get("joint_values_deg")):
+        live_joint_values_deg = list(pose.get("joint_values_deg") or [])
+        live_track_m = float(pose.get("track_m") or 0.0)
+        live_j7_mm = float(pose.get("j7_mm") or 0.0)
+        if to_bool(get_optional_input("DrawRobot", True), True) and live_joint_values_deg:
+            geom = build_live_geometry(live_joint_values_deg, live_track_m)
+            flange_plane = geom["flange_plane"]
+            tcp_plane = geom["tcp_plane"]
+            robot_geometry = geom["robot_geometry"]
+            tool_geometry = geom["tool_geometry"]
 
 except Exception as e:
     sent_commands = []
@@ -981,4 +1155,11 @@ except Exception as e:
     run_index = -1
     completed = False
     failed_index = -1
+    live_joint_values_deg = []
+    live_track_m = 0.0
+    live_j7_mm = 0.0
+    flange_plane = rg.Plane.Unset
+    tcp_plane = rg.Plane.Unset
+    robot_geometry = []
+    tool_geometry = []
     status = "ERROR: {}".format(e)

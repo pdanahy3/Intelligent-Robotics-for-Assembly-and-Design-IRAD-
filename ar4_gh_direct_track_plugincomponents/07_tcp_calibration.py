@@ -1,5 +1,25 @@
 #! python3
 
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   Captures
+#   Solve
+#   Apply
+#   Clear
+#   MaxAxisTiltDeg
+# OUTPUTS:
+#   tcp_frame
+#   tcp_plane_local
+#   tcp_offset_mm
+#   fit_max_mm
+#   fit_rms_mm
+#   calibration_point
+#   warnings
+#   status
+# =============================================================================
+
 """
 AR4 + External Track — Component 7: TCP Calibration
 Grasshopper Python 3 / Rhino 8

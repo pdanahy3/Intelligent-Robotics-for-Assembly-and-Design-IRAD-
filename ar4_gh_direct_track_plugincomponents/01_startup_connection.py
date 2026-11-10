@@ -4,11 +4,58 @@
 # r: compas_fab
 # r: compas_robots
 
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   Load
+#   Reload
+#   URDF
+#   PackageRoot
+#   PreferredPort
+#   Baud
+#   TestCommand
+#   Connect
+#   BasePlane
+#   ToolMeshes
+#   ToolTCPPlane
+#   ToolTCPPoint
+# OUTPUTS:
+#   cache_id
+#   robot_model
+#   robot_name
+#   joint_names
+#   motion_joint_names
+#   link_names
+#   mesh_link_names
+#   mesh_count
+#   available_ports
+#   active_port
+#   connected
+#   handshake_reply
+#   live_joint_values_deg
+#   live_j7_mm
+#   live_track_m
+#   live_rp_raw
+#   base_plane
+#   tool_meshes
+#   tool_tcp_plane
+#   startup_state
+#   status
+# =============================================================================
+
 """
 AR4 + External Track — Component 1: Startup / Connection
 
 Loads and caches the robot, the tool and the robot's placement, then seeds
 the sticky defaults every other component reads.
+
+SERIAL OWNERSHIP
+----------------
+This component owns the COM port. Leave Connect=True for the session; the
+handle stays open in sticky AR4_SERIAL_BUS and Comp2 / Comp5 / Comp6 send
+through it. Set Connect=False to disconnect. Opening the port resets the
+Teensy, so only Comp1 should ever open it.
 
 TOOL INPUTS (all optional)
 --------------------------
@@ -20,17 +67,17 @@ ToolTCPPoint  : nominal flange-local tool tip. Fixes where the tip is but not
                 how the tool is turned, so target plane orientation still
                 resolves against the flange until Comp7 measures the frame.
 
-The tool is cached to AR4_TOOL_MESHES and AR4_TOOL_TCP_FRAME. Comp3, Comp4
-and Comp6 read those; their own pins still win, which is what lets two robots
-sharing this cache_id carry different tooling.
-
-Outputs add tool_meshes and tool_tcp_plane.
+The tool is cached to AR4_TOOL_MESHES and AR4_TOOL_TCP_FRAME. Comp3 / Comp4 /
+Comp5 / Comp6 read those from sticky only — they do not take ToolMeshes or
+TCP pins. Comp7 calibration (AR4_TCP_FRAME) overrides the nominal Comp1 TCP
+when present.
 """
 
 import os
 import time
 import math
 import struct
+import threading
 import xml.etree.ElementTree as ET
 
 import Rhino.Geometry as rg
@@ -39,6 +86,10 @@ try:
     import scriptcontext as sc
 except Exception:
     sc = None
+
+SERIAL_BUS_KEY = "AR4_SERIAL_BUS"
+# Raw pyserial handle mirror so a leaked bus can still release COM on retry.
+SERIAL_HANDLE_KEY = "AR4_SERIAL_PORT_HANDLE"
 
 
 # ------------------------------------------------------------
@@ -628,53 +679,420 @@ def choose_port(preferred_port, available_port_labels, available_port_names):
     return ""
 
 
-def serial_handshake(port, baud, command, timeout):
-    import serial
-
-    reply_lines = []
-    raw_reply = ""
-
-    ser = serial.Serial(
-        port=port,
-        baudrate=baud,
-        timeout=0.1,
-        write_timeout=2.0
+def is_rp_line(line):
+    return (
+        isinstance(line, str)
+        and line.startswith("A")
+        and "B" in line
+        and "C" in line
+        and "P" in line
     )
 
-    # Teensy serial connection settle time.
-    time.sleep(2.0)
+
+def parse_live_rp(rp, track_length=870.0, track_inverted=False):
+    """Minimal RP parse for Comp1 live-pose outputs."""
+    result = {
+        "parsed": False,
+        "joint_values_deg": [],
+        "j7_mm": 0.0,
+        "track_m": 0.0,
+        "raw": rp or "",
+    }
+
+    if not rp:
+        return result
+
+    def between(s, a, b=None):
+        start = s.find(a)
+        if start < 0:
+            return ""
+        start += len(a)
+        if b is None:
+            return s[start:].strip()
+        end = s.find(b, start)
+        if end < 0:
+            return s[start:].strip()
+        return s[start:end].strip()
 
     try:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+        joints = [
+            float(between(rp, "A", "B")),
+            float(between(rp, "B", "C")),
+            float(between(rp, "C", "D")),
+            float(between(rp, "D", "E")),
+            float(between(rp, "E", "F")),
+            float(between(rp, "F", "G")),
+        ]
+        j7 = float(between(rp, "P", "Q"))
+        length = track_length if track_length > 0.0 else 870.0
+        track_m = max(0.0, min(1.0, j7 / length))
+        if track_inverted:
+            track_m = 1.0 - track_m
+        result["parsed"] = True
+        result["joint_values_deg"] = joints
+        result["j7_mm"] = j7
+        result["track_m"] = track_m
     except Exception:
         pass
 
-    wire_command = command.strip() + "\n"
+    return result
 
-    ser.write(wire_command.encode("utf-8"))
-    ser.flush()
 
-    start = time.time()
-    buffer = ""
+class SerialBus(object):
+    """
+    Process-wide serial owner for one robot controller.
 
-    while time.time() - start < timeout:
-        if ser.in_waiting > 0:
-            data = ser.read(ser.in_waiting)
-            text = data.decode("utf-8", errors="ignore")
-            buffer += text
+    Comp1 opens this once and leaves it in sticky AR4_SERIAL_BUS. Comp2 / Comp5 /
+    Comp6 must send through write_command / wait_ack / send_and_wait and must
+    never open the COM port themselves — a second open resets the Teensy and
+    races the reader thread.
+    """
 
-            if "\n" in buffer:
-                break
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.ser = None
+        self.port = ""
+        self.baud = 0
+        self.generation = 0
+        self._stop = threading.Event()
+        self._thread = None
+        self._rx = ""
+        self._ack_queue = []
+        self._ack_event = threading.Event()
+        self.latest_rp = ""
+        self.latest_pose = parse_live_rp("")
+        self.last_error = ""
+        self.connected_at = 0.0
 
-        time.sleep(0.02)
+    def is_connected(self):
+        with self.lock:
+            return self.ser is not None and getattr(self.ser, "is_open", False)
 
-    ser.close()
+    def connect(self, port, baud, settle_s=2.0):
+        import serial
 
-    raw_reply = buffer
-    reply_lines = [line.strip() for line in buffer.splitlines() if line.strip()]
+        port = str(port or "").strip()
+        baud = int(baud)
 
-    return reply_lines, raw_reply
+        if not port:
+            raise Exception("No COM port to connect.")
+
+        with self.lock:
+            already = (
+                self.ser is not None
+                and getattr(self.ser, "is_open", False)
+                and self.port == port
+                and self.baud == baud
+            )
+        if already:
+            return False
+
+        # Opening USB CDC resets the Teensy. Do it only when the port changes.
+        self.disconnect()
+
+        try:
+            ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                timeout=0.05,
+                write_timeout=30.0,
+            )
+        except Exception as e:
+            # A previous Comp1 solve may have orphaned the COM handle after an
+            # isinstance(SerialBus) sticky replace. Close any mirrored handle
+            # and retry once.
+            msg = str(e).lower()
+            if "access is denied" in msg or "permissionerror" in msg:
+                _force_release_serial_handle()
+                try:
+                    ser = serial.Serial(
+                        port=port,
+                        baudrate=baud,
+                        timeout=0.05,
+                        write_timeout=30.0,
+                    )
+                except Exception as e2:
+                    raise Exception(
+                        "could not open port '{}': {}. "
+                        "COM is still held — unplug the Teensy USB or restart "
+                        "Rhino once, then set Connect=True again.".format(port, e2)
+                    )
+            else:
+                raise
+
+        time.sleep(max(0.0, float(settle_s)))
+
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            pass
+
+        with self.lock:
+            self.ser = ser
+            self.port = port
+            self.baud = baud
+            self.generation += 1
+            self.last_error = ""
+            self.connected_at = time.time()
+            self._rx = ""
+            self._ack_queue = []
+            self._ack_event.clear()
+            self._stop.clear()
+            gen = self.generation
+            self._thread = threading.Thread(
+                target=self._reader_loop,
+                args=(gen,),
+                name="AR4SerialBus-{}".format(port),
+            )
+            self._thread.daemon = True
+            self._thread.start()
+
+        if sc is not None:
+            sc.sticky[SERIAL_HANDLE_KEY] = ser
+
+        return True
+
+    def disconnect(self):
+        with self.lock:
+            self._stop.set()
+            self.generation += 1
+            thread = self._thread
+            ser = self.ser
+            self._thread = None
+            self.ser = None
+            self.port = ""
+            self.baud = 0
+            self._ack_queue = []
+            self._ack_event.set()
+
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+        if sc is not None:
+            held = sc.sticky.get(SERIAL_HANDLE_KEY, None)
+            if held is ser or held is not None:
+                try:
+                    if held is not ser and getattr(held, "is_open", False):
+                        held.close()
+                except Exception:
+                    pass
+                try:
+                    sc.sticky.pop(SERIAL_HANDLE_KEY, None)
+                except Exception:
+                    pass
+
+        self._ack_event.clear()
+
+    def _reader_loop(self, generation):
+        while not self._stop.is_set():
+            with self.lock:
+                if generation != self.generation or self.ser is None:
+                    return
+                ser = self.ser
+
+            try:
+                waiting = ser.in_waiting
+            except Exception as e:
+                self.last_error = str(e)
+                time.sleep(0.02)
+                continue
+
+            if waiting and waiting > 0:
+                try:
+                    chunk = ser.read(waiting).decode("utf-8", errors="ignore")
+                except Exception as e:
+                    self.last_error = str(e)
+                    time.sleep(0.02)
+                    continue
+
+                with self.lock:
+                    if generation != self.generation:
+                        return
+                    self._rx += chunk
+                    while "\n" in self._rx:
+                        line, self._rx = self._rx.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        self._handle_line_locked(line)
+            else:
+                time.sleep(0.005)
+
+    def _handle_line_locked(self, line):
+        track_length = 870.0
+        track_inverted = False
+        if sc is not None:
+            try:
+                track_length = float(sc.sticky.get("AR4_TRACK_LENGTH_MM", 870.0) or 870.0)
+            except Exception:
+                track_length = 870.0
+            track_inverted = str(
+                sc.sticky.get("AR4_TRACK_FIRMWARE_INVERTED", False)
+            ).strip().lower() in ["true", "1", "yes", "y"]
+
+        if is_rp_line(line):
+            self.latest_rp = line
+            self.latest_pose = parse_live_rp(line, track_length, track_inverted)
+
+        # Every line is queued. wait_ack filters for RP/ER/EL unless
+        # accept_any_line is set (handshake / TL).
+        self._ack_queue.append(line)
+        self._ack_event.set()
+
+    def write_command(self, command):
+        text = str(command).strip()
+        if not text:
+            raise Exception("Empty serial command.")
+
+        with self.lock:
+            if self.ser is None or not getattr(self.ser, "is_open", False):
+                raise Exception(
+                    "Serial bus is not connected. Set Comp1 Connect=True and leave it on."
+                )
+            self.ser.write((text + "\n").encode("utf-8"))
+            self.ser.flush()
+
+    def clear_acks(self):
+        with self.lock:
+            self._ack_queue = []
+            self._ack_event.clear()
+
+    def wait_ack(self, timeout, accept_any_line=False):
+        """
+        Wait for one terminal reply (RP / ER / EL), or any newline if
+        accept_any_line is True (handshake / TL).
+
+        timeout <= 0 polls the queue once and returns immediately
+        (TIMEOUT_EMPTY if nothing is ready). Comp5 must use that so the
+        Grasshopper solve thread never blocks for a whole robot move.
+        """
+        timeout = float(timeout)
+        if timeout <= 0.0:
+            deadline = time.time()
+        else:
+            deadline = time.time() + timeout
+        other = []
+
+        while True:
+            with self.lock:
+                while self._ack_queue:
+                    line = self._ack_queue.pop(0)
+                    if line == "ER":
+                        return "ERROR_ER", line
+                    if line.startswith("EL"):
+                        return "ERROR_EL", line
+                    if is_rp_line(line):
+                        return "RP", line
+                    if accept_any_line:
+                        return "LINE", line
+                    other.append(line)
+                self._ack_event.clear()
+
+            remaining = deadline - time.time()
+            if remaining <= 0.0:
+                if other:
+                    return "TIMEOUT_WITH_DATA", " | ".join(other)
+                return "TIMEOUT_EMPTY", ""
+
+            self._ack_event.wait(min(0.05, remaining))
+
+    def poll_ack(self, accept_any_line=False):
+        """Non-blocking single check for a terminal reply."""
+        return self.wait_ack(0.0, accept_any_line=accept_any_line)
+
+    def send_and_wait(self, command, timeout, accept_any_line=False):
+        self.clear_acks()
+        self.write_command(command)
+        return self.wait_ack(timeout, accept_any_line=accept_any_line)
+
+    def snapshot_pose(self):
+        with self.lock:
+            pose = dict(self.latest_pose)
+            pose["raw"] = self.latest_rp
+            return pose
+
+
+def _force_release_serial_handle():
+    """Best-effort close of a leaked pyserial handle kept in sticky."""
+    if sc is None:
+        return
+    held = sc.sticky.get(SERIAL_HANDLE_KEY, None)
+    if held is not None:
+        try:
+            held.close()
+        except Exception:
+            pass
+        try:
+            sc.sticky.pop(SERIAL_HANDLE_KEY, None)
+        except Exception:
+            pass
+    bus = sc.sticky.get(SERIAL_BUS_KEY, None)
+    if bus is not None and callable(getattr(bus, "disconnect", None)):
+        try:
+            if callable(getattr(bus, "is_connected", None)) and bus.is_connected():
+                bus.disconnect()
+        except Exception:
+            pass
+
+
+def _bus_looks_usable(bus):
+    """
+    Duck-type check. GH re-executes this script every solve, which creates a
+    new SerialBus class object each time — isinstance(sticky_bus, SerialBus)
+    is therefore almost always False across solves. Using isinstance orphaned
+    the open COM handle (Access Denied on the next connect).
+    """
+    return (
+        bus is not None
+        and callable(getattr(bus, "is_connected", None))
+        and callable(getattr(bus, "connect", None))
+        and callable(getattr(bus, "disconnect", None))
+        and callable(getattr(bus, "send_and_wait", None))
+        and callable(getattr(bus, "write_command", None))
+        and callable(getattr(bus, "wait_ack", None))
+        and callable(getattr(bus, "snapshot_pose", None))
+    )
+
+
+def get_or_create_bus():
+    if sc is None:
+        raise Exception("scriptcontext is not available.")
+    bus = sc.sticky.get(SERIAL_BUS_KEY)
+    if _bus_looks_usable(bus):
+        return bus
+
+    # Whatever is in sticky is unusable — release its port before replacing.
+    if bus is not None and callable(getattr(bus, "disconnect", None)):
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+
+    bus = SerialBus()
+    sc.sticky[SERIAL_BUS_KEY] = bus
+    return bus
+
+
+def get_connected_bus():
+    """Used by Comp2 / Comp5 / Comp6. Returns None if Comp1 is not connected."""
+    if sc is None:
+        return None
+    bus = sc.sticky.get(SERIAL_BUS_KEY)
+    if not _bus_looks_usable(bus):
+        return None
+    try:
+        if bus.is_connected():
+            return bus
+    except Exception:
+        return None
+    return None
 
 
 # ------------------------------------------------------------
@@ -691,7 +1109,12 @@ mesh_link_names = []
 mesh_count = 0
 available_ports = []
 active_port = ""
+connected = False
 handshake_reply = []
+live_joint_values_deg = []
+live_j7_mm = 0.0
+live_track_m = 0.0
+live_rp_raw = ""
 base_plane = None
 tool_meshes = []
 tool_tcp_plane = None
@@ -857,42 +1280,69 @@ try:
     sc.sticky["AR4_TOOL_SOURCE"] = tool_tcp_source
 
     # ------------------------------------------------------------
-    # 3. Optional serial handshake
+    # 3. Own the serial port for the whole session
     # ------------------------------------------------------------
+    # Leave Connect=True. Comp2 / Comp5 / Comp6 send through sticky
+    # AR4_SERIAL_BUS and must not open the COM port themselves.
+
+    bus = get_or_create_bus()
+    handshake_reply = []
+    handshake_raw = ""
 
     if connect:
-
         if not active_port:
-            handshake_reply = []
-            handshake_raw = ""
             serial_status = "No active COM port found."
-
+            connected = False
         else:
             try:
-                handshake_reply, handshake_raw = serial_handshake(
-                    active_port,
-                    baud,
-                    test_command,
-                    3.0
-                )
+                opened = bus.connect(active_port, baud, settle_s=2.0)
+                connected = bus.is_connected()
 
-                if handshake_reply:
-                    serial_status = "Connected. {} returned {} line(s).".format(
-                        test_command,
-                        len(handshake_reply)
-                    )
+                if test_command:
+                    # Only handshake when the port was just opened, so a
+                    # sustained Connect=True does not spam HO every solve.
+                    if opened:
+                        status_code, line = bus.send_and_wait(
+                            test_command,
+                            timeout=3.0,
+                            accept_any_line=True
+                        )
+                        if line:
+                            handshake_reply = [line]
+                            handshake_raw = line
+                        serial_status = (
+                            "Port open on {}. Handshake {} -> {}."
+                        ).format(active_port, test_command, status_code)
+                    else:
+                        pose = bus.snapshot_pose()
+                        serial_status = (
+                            "Holding open connection on {} @ {}."
+                        ).format(bus.port, bus.baud)
+                        if pose.get("parsed"):
+                            serial_status += " Latest RP available."
                 else:
-                    serial_status = "Sent {}, but no reply received.".format(test_command)
+                    serial_status = "Port open on {} @ {}.".format(
+                        active_port,
+                        baud
+                    )
 
             except Exception as e:
-                handshake_reply = []
-                handshake_raw = ""
+                connected = False
                 serial_status = "Serial connection error: {}".format(e)
-
     else:
-        handshake_reply = []
-        handshake_raw = ""
-        serial_status = "Connect is False. Port scan only."
+        if bus.is_connected():
+            bus.disconnect()
+        connected = False
+        serial_status = "Connect=False. Serial bus disconnected."
+
+    pose = bus.snapshot_pose() if bus.is_connected() else parse_live_rp("")
+    live_joint_values_deg = list(pose.get("joint_values_deg") or [])
+    live_j7_mm = float(pose.get("j7_mm") or 0.0)
+    live_track_m = float(pose.get("track_m") or 0.0)
+    live_rp_raw = str(pose.get("raw") or "")
+    connected = bool(bus.is_connected())
+    if connected:
+        active_port = bus.port or active_port
 
     # ------------------------------------------------------------
     # 4. Store startup state
@@ -904,6 +1354,8 @@ try:
         "package_root": package_root,
         "port": active_port,
         "baud": baud,
+        "connected": connected,
+        "serial_bus_key": SERIAL_BUS_KEY,
         "test_command": test_command,
         "base_plane": base_plane,
         "track_length_mm": 870.0,
@@ -982,9 +1434,10 @@ try:
     else:
         tool_text = " No tool loaded."
 
-    status = "{} Active port: {}.{}{} {}{}".format(
+    status = "{} Port: {} (connected={}).{}{} {}{}".format(
         model_status,
         active_port if active_port else "None",
+        connected,
         base_text,
         tool_text,
         serial_status,
@@ -1002,7 +1455,12 @@ except Exception as e:
     mesh_count = 0
     available_ports = []
     active_port = ""
+    connected = False
     handshake_reply = []
+    live_joint_values_deg = []
+    live_j7_mm = 0.0
+    live_track_m = 0.0
+    live_rp_raw = ""
     base_plane = None
     tool_meshes = []
     tool_tcp_plane = None

@@ -3,6 +3,52 @@
 # r: compas_fab
 # r: compas_robots
 
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   cache_id
+#   Targets
+#   Speed
+#   Accel
+#   Decel
+#   Ramp
+#   Wrist
+#   UseTrack
+#   Solve
+#   UseCalibratedTCP
+#   PosTolMM
+#   RotTolDeg
+#   RotationWeight
+#   MaxSeeds
+#   MaxSolveSeconds
+#   BasePlane
+#   TargetUnitsMM
+#   SplitTrackMotion
+#   TrackSpeedPercent
+#   TrackLengthMM
+#   TrackRailLengthMM
+#   TrackMoveEpsilonMM
+#   TrackFirmwareInverted
+#   HomeJointsDeg
+#   JointSigns
+#   UseCalibrationFrame
+# OUTPUTS:
+#   solved
+#   program_joint_values_rad
+#   program_joint_values_deg
+#   program_track_m
+#   program_j7_mm
+#   rj_commands
+#   ik_errors
+#   tcp_pos_error_mm
+#   tcp_rot_error_deg
+#   target_planes_robot
+#   tcp_planes_solved
+#   program_state
+#   status
+# =============================================================================
+
 """
 AR4 + External Track — Component 3: Program / IK Planner
 Calibration-frame aware replacement.
@@ -61,23 +107,11 @@ Wrist               : firmware W token, usually "F"
 UseTrack            : bool, solve with track_joint enabled
 Solve               : bool edge trigger; toggle False -> True to recompute
 
-TCP INPUTS — replaces the old scalar ToolZ
-------------------------------------------
-The TCP frame is the rigid transform from the tool/flange link to the tool
-tip, authored in flange-local Rhino units. It carries orientation, not just
-offset, so the IK aligns the real tool frame with the target plane.
-
-Highest wins:
-UseCalibratedTCP    : bool, default True. Use the frame Comp7 logged to
-                      sticky AR4_TCP_FRAME. Set False to ignore it.
-TCPPlane            : plane. Full tool frame relative to the flange.
-TCPPoint            : point. Tool tip position relative to the flange. Fixes
-                      where the tip is but not how it is turned, so target
-                      plane orientation still resolves against flange axes.
-ToolZ               : legacy scalar mm along flange Z. Kept so old definitions
-                      keep working; prefer TCPPlane or a Comp7 calibration.
-Lowest of all is the nominal TCP Comp1 loaded alongside the tool mesh, so a
-definition that declares its tool once in Comp1 needs no TCP pins here.
+TCP — owned by Comp1 / Comp7 (no TCPPlane / TCPPoint / ToolZ pins here)
+----------------------------------------------------------------------
+The TCP frame is the rigid transform from the flange to the tool tip.
+UseCalibratedTCP    : bool, default True. Prefer Comp7 sticky AR4_TCP_FRAME;
+                      otherwise Comp1 AR4_TOOL_TCP_FRAME.
 
 OPTIONAL INPUTS — add these to the GH Python component when needed
 -----------------------------------------------------------------
@@ -693,16 +727,13 @@ def resolve_tcp_frame(target_scale):
     """
     Returns (flange-local TCP plane in URDF meters, TCP dict).
 
-    Precedence:
-      calibrated frame logged by Comp7, unless UseCalibratedTCP is False
-      TCPPlane : full tool frame authored in Rhino units, flange-local
-      TCPPoint : tool tip position only, axes stay parallel to the flange
-      ToolZ    : legacy scalar offset along flange Z
-      the nominal TCP Comp1 loaded with the tool
+    Tool / TCP are owned by Comp1 (and Comp7 calibration). This component
+    does not take TCPPlane / TCPPoint / ToolZ pins.
 
-    A TCPPoint fixes where the tool tip is but not how it is turned, so the
-    solver still aligns flange axes to the target. Only TCPPlane or a Comp7
-    calibration give the target plane's orientation any meaning.
+    Precedence:
+      Comp7 AR4_TCP_FRAME when UseCalibratedTCP is True
+      Comp1 AR4_TOOL_TCP_FRAME
+      flange identity
     """
     use_calibrated = to_bool(get_optional_input("UseCalibratedTCP", True), True)
 
@@ -711,30 +742,6 @@ def resolve_tcp_frame(target_scale):
 
         if isinstance(cal, dict):
             return tcp_dict_to_plane(cal), dict(cal)
-
-    plane = to_plane(get_optional_input("TCPPlane", None), None)
-
-    if plane is not None:
-        local = scale_plane_origin(plane, target_scale)
-        return local, plane_to_tcp_dict(local, "TCPPlane input")
-
-    point = to_plane(get_optional_input("TCPPoint", None), None)
-
-    if point is not None:
-        local = scale_plane_origin(
-            rg.Plane(point.Origin, rg.Vector3d.XAxis, rg.Vector3d.YAxis),
-            target_scale
-        )
-        return local, plane_to_tcp_dict(local, "TCPPoint input (no orientation)")
-
-    tool_z_mm = to_float(get_optional_input("ToolZ", None), None)
-
-    if tool_z_mm is not None and abs(tool_z_mm) > 1e-12:
-        local = offset_plane_along_z(rg.Plane.WorldXY, tool_z_mm * target_scale)
-        return local, plane_to_tcp_dict(
-            local,
-            "ToolZ legacy ({:.1f} mm)".format(tool_z_mm)
-        )
 
     if sc is not None:
         nominal = sc.sticky.get("AR4_TOOL_TCP_FRAME", None)
@@ -2216,19 +2223,43 @@ status = ""
 # Main
 # ------------------------------------------------------------
 
+def find_latest_cache_id():
+    """Fallback when the cache_id pin is missing or unwired."""
+    if sc is None:
+        return ""
+    best = ""
+    for key in list(sc.sticky.keys()):
+        k = str(key)
+        if k.endswith("::startup_state"):
+            best = k[: -len("::startup_state")]
+        elif k.endswith("::model") and not best:
+            best = k[: -len("::model")]
+    return best
+
+
 try:
     if sc is None:
         raise Exception("scriptcontext is not available.")
 
-    cid = to_text(cache_id, "").strip()
+    # cache_id is a required GH input, but fall back to sticky if the pin was
+    # dropped when rewiring from GH_PINS (NameError would otherwise wipe all
+    # outputs into a blank ERROR status).
+    cid = to_text(get_optional_input("cache_id", None), "").strip()
+    if not cid or cid == "None":
+        cid = find_latest_cache_id()
 
     if not cid or cid == "None":
-        raise Exception("No cache_id provided. Connect cache_id from Startup.")
+        raise Exception(
+            "No cache_id. Connect Startup cache_id into Comp3, then Load/Reload."
+        )
 
     model = sc.sticky.get(cid + "::model", None)
 
     if model is None:
-        raise Exception("No cached robot model found. Run Startup first.")
+        raise Exception(
+            "No cached robot model for '{}'. Run Startup with Load=True first."
+            .format(cid)
+        )
 
     raw_targets = flatten_targets(Targets)
 

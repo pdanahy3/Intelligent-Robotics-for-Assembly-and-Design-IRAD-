@@ -3,6 +3,42 @@
 # r: compas_fab
 # r: compas_robots
 
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   Commands
+#   Time
+#   DrawRobot
+#   DrawTrack
+#   DrawPath
+#   DrawTargets
+#   DrawSkeleton
+#   HideGripper
+#   BasePlane
+#   TrackLengthMM
+#   TrackRailLengthMM
+#   TrackFirmwareInverted
+#   HomeJointsDeg
+#   JointSigns
+# OUTPUTS:
+#   active_index
+#   active_command
+#   active_joint_values_deg
+#   active_joint_values_rad
+#   active_track_m
+#   active_j7_mm
+#   robot_geometry
+#   tool_geometry
+#   track_geometry
+#   tcp_planes
+#   tcp_path
+#   target_geometry
+#   skeleton_lines
+#   simulation_state
+#   status
+# =============================================================================
+
 """
 AR4 + External Track — Component 4: Simulation Visualization
 Grasshopper Python 3 / Rhino 8
@@ -30,17 +66,11 @@ Expected GH inputs (all optional except Commands):
   TrackFirmwareInverted : bool (default sticky / False)
   BasePlane         : plane. Where this robot's URDF world sits.
 
-TCP and tooling:
-  TCPPlane          : plane. Full flange-local tool frame, Rhino units.
-  TCPPoint          : point. Flange-local tool tip, orientation left on flange.
-  ToolZ             : legacy scalar mm along flange Z.
-  Unwired, the sim draws the TCP frame Comp3 solved against, so the simulated
-  tool always matches the program.
+TCP and tooling come from Comp1 sticky (AR4_TOOL_*) and Comp7 calibration
+(AR4_TCP_FRAME). Prefer the TCP Comp3 solved against when program_state is
+present so the sim matches the program.
 
-  ToolMeshes        : meshes standing in for the gripper, authored around the
-                      Rhino origin as though the flange sat on WorldXY.
-  HideGripper       : bool. Defaults True once ToolMeshes is wired, which drops
-                      the URDF gripper links from the drawing only.
+  HideGripper       : bool. Defaults True once Comp1 has tool meshes.
 
 Outputs add tool_geometry alongside robot_geometry.
 """
@@ -516,54 +546,24 @@ def plane_origin_to_meters(plane, mm_per_unit=0.001):
 
 def resolve_tcp_frame(program_state=None):
     """
-    Returns (flange-local TCP plane in URDF meters, source label).
-
-    Comp3 publishes the frame it actually solved against, and that is what the
-    sim should draw — otherwise the simulated tool sits somewhere the IK never
-    aimed. The pins exist only to override that.
+    Flange-local TCP in URDF meters. Owned by Comp1 / Comp7; Comp3's solved
+    frame wins when present so the sim matches the program.
     """
-    plane = to_plane(gh_input("TCPPlane", None), None)
-
-    if plane is not None:
-        return plane_origin_to_meters(plane), "TCPPlane input"
-
-    point = to_plane(gh_input("TCPPoint", None), None)
-
-    if point is not None:
-        return (
-            plane_origin_to_meters(
-                rg.Plane(point.Origin, rg.Vector3d.XAxis, rg.Vector3d.YAxis)
-            ),
-            "TCPPoint input"
-        )
-
-    tool_z_mm = to_float(gh_input("ToolZ", None), None)
-
-    if tool_z_mm is not None and abs(tool_z_mm) > 1e-12:
-        return (
-            offset_plane_along_z(rg.Plane.WorldXY, tool_z_mm * 0.001),
-            "ToolZ legacy ({:.1f} mm)".format(tool_z_mm)
-        )
-
     if isinstance(program_state, dict):
         d = program_state.get("tcp_frame", None)
-
         if isinstance(d, dict):
             return tcp_dict_to_plane(d), "Comp3 " + str(d.get("source", ""))
 
     if sc is not None:
         d = sc.sticky.get("AR4_LAST_PROGRAM_TCP_FRAME", None)
-
         if isinstance(d, dict):
             return tcp_dict_to_plane(d), "Comp3 sticky " + str(d.get("source", ""))
 
         d = sc.sticky.get("AR4_TCP_FRAME", None)
-
         if isinstance(d, dict):
             return tcp_dict_to_plane(d), "Comp7 " + str(d.get("source", ""))
 
         d = sc.sticky.get("AR4_TOOL_TCP_FRAME", None)
-
         if isinstance(d, dict):
             return tcp_dict_to_plane(d), str(d.get("source", "Comp1 tool"))
 
@@ -594,46 +594,11 @@ def apply_tcp_frame(flange_plane, tcp_local, display_scale):
 
 
 def get_tool_meshes():
-    """
-    Meshes standing in for the gripper, authored in Rhino units around the
-    origin as though the flange were sitting on WorldXY.
-
-    Comp1 loads the tool and caches it; the pin is the per-robot override for
-    when two robots share a cache_id but carry different tooling.
-    """
-    raw = gh_input("ToolMeshes", None)
-
-    if raw is None:
-        if sc is not None:
-            cached = sc.sticky.get("AR4_TOOL_MESHES", None)
-
-            if isinstance(cached, list):
-                return list(cached)
-
+    """Tool meshes are owned by Comp1 (sticky AR4_TOOL_MESHES)."""
+    if sc is None:
         return []
-
-    try:
-        items = list(raw)
-    except TypeError:
-        items = [raw]
-
-    meshes = []
-
-    for item in items:
-        item = unwrap_gh(item)
-
-        if item is None:
-            continue
-
-        if isinstance(item, rg.Mesh):
-            meshes.append(item)
-            continue
-
-        if isinstance(item, rg.Brep):
-            for m in (rg.Mesh.CreateFromBrep(item, rg.MeshingParameters.Default) or []):
-                meshes.append(m)
-
-    return meshes
+    cached = sc.sticky.get("AR4_TOOL_MESHES", None)
+    return list(cached) if isinstance(cached, list) else []
 
 
 def draw_tool_meshes(tool_meshes, flange_plane):

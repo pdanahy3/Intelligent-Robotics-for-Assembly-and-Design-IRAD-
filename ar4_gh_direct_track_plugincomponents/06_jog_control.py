@@ -4,6 +4,64 @@
 # r: compas_robots
 # r: pyserial
 
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   J1
+#   J2
+#   J3
+#   J4
+#   J5
+#   J6
+#   TrackM
+#   Send
+#   Capture
+#   CaptureLabel
+#   ClearCaptures
+#   Speed
+#   SpeedType
+#   Accel
+#   Decel
+#   Ramp
+#   Wrist
+#   SendTimeout
+#   EncodeFirmwareOnSend
+#   DrawRobot
+#   DrawTrack
+#   DrawSkeleton
+#   Mode
+#   X
+#   Y
+#   Z
+#   Rx
+#   Ry
+#   Rz
+#   HideGripper
+#   BasePlane
+#   TrackLengthMM
+#   TrackRailLengthMM
+#   TrackFirmwareInverted
+#   HomeJointsDeg
+#   JointSigns
+# OUTPUTS:
+#   robot_geometry
+#   tool_geometry
+#   track_geometry
+#   skeleton_lines
+#   flange_plane
+#   tcp_plane
+#   joints_urdf_deg
+#   xyz_mm
+#   rpy_deg
+#   rj_command
+#   captures
+#   capture_count
+#   capture_labels
+#   jog_state
+#   status
+# =============================================================================
+
 """
 AR4 + External Track — Component 6: Manual Jog / Pose Capture
 Grasshopper Python 3 / Rhino 8
@@ -30,53 +88,44 @@ percentage move (Sp) at 15 percent rather than Comp3's Sm.
 
 INPUTS
 ------
-J1..J6            : float sliders, URDF degrees
-TrackM            : float slider 0..1, fraction of usable track travel
-BasePlane         : plane. Where this robot's URDF world sits. Default WorldXY.
+Mode              : "joint" (default) or "cartesian" / "cart" / "absolute"
+J1..J6            : joint mode — URDF degrees
+TrackM            : 0..1 usable track travel (both modes)
+X,Y,Z             : cartesian — absolute TCP in robot-base mm once you move
+                    those pins (same frame as Comp3). Untouched pins keep the
+                    TCP frozen at mode entry.
+Rx,Ry,Rz          : rotation jog in degrees about the TCP tool axes
+                    (Rx about TCP X, then Ry about TCP Y, then Rz about TCP Z).
+                    Values are deltas from the pin reading at mode entry, so
+                    leave them at 0 and nudge. Rotations are always centered
+                    on the TCP, not the flange.
 
-Serial (all optional; Send does nothing without Port):
-Port              : COM port string
-Baud              : default 9600
-Send              : bool edge trigger. False -> True sends the current pose.
-Speed             : default 15.0
-SpeedType         : "p" percent (default), "m" mm/sec, "s" seconds
-Accel/Decel/Ramp  : firmware Ac / Dc / Rm, default 10 / 10 / 10
-Wrist             : firmware W token, default "F"
-EncodeFirmwareOnSend : bool, default True
+Tool / TCP come from Comp1 sticky (and Comp7 calibration). No ToolMeshes /
+TCPPlane pins on this component.
 
-Capture:
-Capture           : bool edge trigger. False -> True logs the current pose.
-CaptureLabel      : text tag for the capture, e.g. "tip1" or "axisX"
-ClearCaptures     : bool edge trigger. Wipes the capture log.
+Serial (Comp1 bus; Send ignored if Connect is False):
+Send, Speed, SpeedType, Accel, Decel, Ramp, Wrist, EncodeFirmwareOnSend,
+SendTimeout
 
-Display:
-DrawRobot / DrawTrack / DrawSkeleton : bools
-ToolMeshes        : meshes standing in for the gripper
-HideGripper       : bool, defaults True once ToolMeshes is wired
-TCPPlane / TCPPoint / ToolZ : flange-local TCP, same contract as Comp3/Comp4
-
-Track geometry:
-TrackLengthMM     : usable travel, default 870
-TrackRailLengthMM : full rail visual length, default 1000
-TrackFirmwareInverted : bool, default sticky / False
-HomeJointsDeg / JointSigns : 6 floats each, default sticky
+Capture: Capture, CaptureLabel, ClearCaptures
+Display: DrawRobot, DrawTrack, DrawSkeleton, HideGripper
+Track: TrackLengthMM, TrackRailLengthMM, TrackFirmwareInverted
+HomeJointsDeg / JointSigns : defaults from sticky
 
 
 OUTPUTS
 -------
 robot_geometry / tool_geometry / track_geometry / skeleton_lines
-flange_plane      : current flange frame, world display units
-tcp_plane         : current TCP frame, world display units
-rj_command        : the command Send would push (already firmware encoded)
-captures          : the capture log, also in sticky AR4_JOG_CAPTURES
-capture_count
-capture_labels
-jog_state
-status
+flange_plane / tcp_plane
+joints_urdf_deg   : the joint angles actually drawn / sent (both modes)
+xyz_mm / rpy_deg  : current TCP pose readout in robot-base mm / deg
+rj_command, captures, capture_count, capture_labels, jog_state, status
 """
 
 import math
+import os
 import time
+import xml.etree.ElementTree as ET
 
 import Rhino.Geometry as rg
 
@@ -96,6 +145,16 @@ GRIPPER_LINK_NAMES = (
 
 DEFAULT_HOME_URDF_DEG = [-16.0, 0.0, 0.0, 0.0, 22.0, -10.0]
 DEFAULT_JOINT_SIGNS = [-1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+MOTION_JOINT_NAMES = [
+    "track_joint",
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6"
+]
 
 
 # ------------------------------------------------------------
@@ -383,38 +442,13 @@ def plane_origin_to_meters(plane, mm_per_unit=0.001):
 
 
 def resolve_tcp_frame():
-    """Flange-local TCP frame in URDF meters, plus a source label."""
-    plane = to_plane(gh_input("TCPPlane", None), None)
-
-    if plane is not None:
-        return plane_origin_to_meters(plane), "TCPPlane input"
-
-    point = to_plane(gh_input("TCPPoint", None), None)
-
-    if point is not None:
-        return (
-            plane_origin_to_meters(
-                rg.Plane(point.Origin, rg.Vector3d.XAxis, rg.Vector3d.YAxis)
-            ),
-            "TCPPoint input"
-        )
-
-    tool_z_mm = to_float(gh_input("ToolZ", None), None)
-
-    if tool_z_mm is not None and abs(tool_z_mm) > 1e-12:
-        return (
-            offset_plane_along_z(rg.Plane.WorldXY, tool_z_mm * 0.001),
-            "ToolZ legacy ({:.1f} mm)".format(tool_z_mm)
-        )
-
+    """Flange-local TCP in URDF meters from Comp7 / Comp1 sticky only."""
     if sc is not None:
         d = sc.sticky.get("AR4_TCP_FRAME", None)
-
         if isinstance(d, dict):
             return tcp_dict_to_plane(d), "Comp7 " + str(d.get("source", ""))
 
         d = sc.sticky.get("AR4_TOOL_TCP_FRAME", None)
-
         if isinstance(d, dict):
             return tcp_dict_to_plane(d), str(d.get("source", "Comp1 tool"))
 
@@ -510,16 +544,183 @@ def safe_fk(model, config, link_name=None):
 
 
 def choose_tool_link(model):
+    """Same preference order as Comp3 so TCP sticky matches the flange link."""
     try:
         link_names = [link.name for link in model.links]
     except Exception:
         link_names = []
 
-    for name in ["tool0", "tool_link", "pneumatic_gripper_tool_link", "ee_link", "link_6"]:
+    for name in ["ee_link", "tool0", "tool_link", "pneumatic_gripper_tool_link", "link_6"]:
         if name in link_names:
             return name
 
     return link_names[-1] if link_names else None
+
+
+def get_urdf_path_from_cache(cache_id):
+    if sc is None or not cache_id:
+        return ""
+
+    state = sc.sticky.get(str(cache_id) + "::startup_state", None)
+    if isinstance(state, dict):
+        return to_text(state.get("urdf", ""), "")
+
+    return ""
+
+
+def parse_float_list_text(text, default_values):
+    if text is None:
+        return list(default_values)
+
+    try:
+        values = [float(v) for v in str(text).replace(",", " ").split()]
+    except Exception:
+        return list(default_values)
+
+    result = list(default_values)
+    for i in range(min(len(values), len(result))):
+        result[i] = values[i]
+    return result
+
+
+def parse_urdf_motion_joints(urdf_path):
+    data = {}
+    if not urdf_path or not os.path.exists(urdf_path):
+        return data
+
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except Exception:
+        return data
+
+    for joint in root.findall("joint"):
+        name = joint.attrib.get("name", "")
+        if name not in MOTION_JOINT_NAMES:
+            continue
+
+        jtype = joint.attrib.get("type", "")
+        parent = joint.find("parent")
+        child = joint.find("child")
+        origin = joint.find("origin")
+        axis = joint.find("axis")
+        limit = joint.find("limit")
+
+        xyz = [0.0, 0.0, 0.0]
+        rpy = [0.0, 0.0, 0.0]
+        if origin is not None:
+            xyz = parse_float_list_text(origin.attrib.get("xyz", None), [0.0, 0.0, 0.0])
+            rpy = parse_float_list_text(origin.attrib.get("rpy", None), [0.0, 0.0, 0.0])
+
+        axis_xyz = [0.0, 0.0, 1.0]
+        if axis is not None:
+            axis_xyz = parse_float_list_text(axis.attrib.get("xyz", None), [0.0, 0.0, 1.0])
+
+        lower = 0.0 if name == "track_joint" else -math.pi
+        upper = 1.0 if name == "track_joint" else math.pi
+        if limit is not None:
+            try:
+                lower = float(limit.attrib.get("lower", lower))
+            except Exception:
+                pass
+            try:
+                upper = float(limit.attrib.get("upper", upper))
+            except Exception:
+                pass
+            # Track q is logical 0..1 even if a URDF lists meter limits.
+            if name == "track_joint" and upper > 1.0 + 1e-9:
+                lower = 0.0
+                upper = 1.0
+
+        data[name] = {
+            "name": name,
+            "type": jtype,
+            "parent": parent.attrib.get("link", "") if parent is not None else "",
+            "child": child.attrib.get("link", "") if child is not None else "",
+            "xyz": xyz,
+            "rpy": rpy,
+            "axis": axis_xyz,
+            "lower": lower,
+            "upper": upper
+        }
+
+    return data
+
+
+def parse_urdf_fk_chain(urdf_path, tool_link):
+    chain = []
+    if not urdf_path or not os.path.exists(urdf_path) or not tool_link:
+        return chain
+
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except Exception:
+        return chain
+
+    joint_by_child = {}
+    for joint in root.findall("joint"):
+        child = joint.find("child")
+        if child is None:
+            continue
+        joint_by_child[child.attrib.get("link", "")] = joint
+
+    link = tool_link
+    guard = 0
+    while link in joint_by_child and guard < 256:
+        guard += 1
+        joint = joint_by_child[link]
+        origin = joint.find("origin")
+        axis = joint.find("axis")
+        parent = joint.find("parent")
+
+        xyz = [0.0, 0.0, 0.0]
+        rpy = [0.0, 0.0, 0.0]
+        if origin is not None:
+            xyz = parse_float_list_text(origin.attrib.get("xyz", None), [0.0, 0.0, 0.0])
+            rpy = parse_float_list_text(origin.attrib.get("rpy", None), [0.0, 0.0, 0.0])
+
+        axis_xyz = [0.0, 0.0, 1.0]
+        if axis is not None:
+            axis_xyz = parse_float_list_text(axis.attrib.get("xyz", None), [0.0, 0.0, 1.0])
+
+        chain.append({
+            "name": joint.attrib.get("name", ""),
+            "type": joint.attrib.get("type", "fixed"),
+            "xyz": xyz,
+            "rpy": rpy,
+            "axis": axis_xyz
+        })
+        link = parent.attrib.get("link", "") if parent is not None else ""
+
+    chain.reverse()
+    return chain
+
+
+def get_joint_info(cache_id, urdf_path):
+    if sc is None:
+        return parse_urdf_motion_joints(urdf_path)
+
+    key = "{}::motion_joint_info::{}".format(cache_id, urdf_path)
+    cached = sc.sticky.get(key, None)
+    if isinstance(cached, dict) and cached:
+        return cached
+
+    joint_info = parse_urdf_motion_joints(urdf_path)
+    sc.sticky[key] = joint_info
+    return joint_info
+
+
+def get_fk_chain(cache_id, urdf_path, tool_link):
+    if sc is None:
+        return parse_urdf_fk_chain(urdf_path, tool_link)
+
+    key = "{}::fk_chain::{}::{}".format(cache_id, urdf_path, tool_link)
+    cached = sc.sticky.get(key, None)
+    if isinstance(cached, list) and cached:
+        return cached
+
+    chain = parse_urdf_fk_chain(urdf_path, tool_link)
+    sc.sticky[key] = chain
+    return chain
 
 
 def frame_to_local_plane(frame):
@@ -617,40 +818,532 @@ def draw_robot_meshes(mesh_cache, frame_by_link, display_scale=1.0, exclude_link
 
 
 def get_tool_meshes():
-    """Comp1 loads and caches the tool; the pin is the per-robot override."""
-    raw = gh_input("ToolMeshes", None)
-
-    if raw is None:
-        if sc is not None:
-            cached = sc.sticky.get("AR4_TOOL_MESHES", None)
-
-            if isinstance(cached, list):
-                return list(cached)
-
+    """Tool meshes are owned by Comp1 (sticky AR4_TOOL_MESHES)."""
+    if sc is None:
         return []
+    cached = sc.sticky.get("AR4_TOOL_MESHES", None)
+    return list(cached) if isinstance(cached, list) else []
 
-    try:
-        items = list(raw)
-    except TypeError:
-        items = [raw]
 
-    meshes = []
+def plane_from_xyz_rpy_mm(x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg):
+    """
+    Robot-base TCP plane in display mm.
 
-    for item in items:
-        item = unwrap_gh(item)
+    Fixed-axis RPY matching URDF convention: R = Rz(rz) Ry(ry) Rx(rx).
+    Rotations use the parent (pre-rotation) axes — same as Comp3 / URDF.
+    """
+    origin = rg.Point3d(x_mm, y_mm, z_mm)
+    plane = rg.Plane(origin, rg.Vector3d.XAxis, rg.Vector3d.YAxis)
+    px = rg.Vector3d(plane.XAxis)
+    py = rg.Vector3d(plane.YAxis)
+    pz = rg.Vector3d(plane.ZAxis)
+    rx = math.radians(rx_deg)
+    ry = math.radians(ry_deg)
+    rz = math.radians(rz_deg)
+    if abs(rx) > 1e-15:
+        plane.Transform(rg.Transform.Rotation(rx, px, origin))
+    if abs(ry) > 1e-15:
+        plane.Transform(rg.Transform.Rotation(ry, py, origin))
+    if abs(rz) > 1e-15:
+        plane.Transform(rg.Transform.Rotation(rz, pz, origin))
+    return plane
 
-        if item is None:
+
+def rpy_deg_from_plane(plane):
+    """Extract fixed-axis RPY degrees from a plane (Rz*Ry*Rx)."""
+    r00 = plane.XAxis.X
+    r10 = plane.XAxis.Y
+    r20 = plane.XAxis.Z
+    r11 = plane.YAxis.Y
+    r12 = plane.ZAxis.Y
+    r21 = plane.YAxis.Z
+    r22 = plane.ZAxis.Z
+    sy = math.sqrt(r00 * r00 + r10 * r10)
+    if sy > 1e-9:
+        rx = math.atan2(r21, r22)
+        ry = math.atan2(-r20, sy)
+        rz = math.atan2(r10, r00)
+    else:
+        rx = math.atan2(-r12, r11)
+        ry = math.atan2(-r20, sy)
+        rz = 0.0
+    return [
+        math.degrees(rx),
+        math.degrees(ry),
+        math.degrees(rz)
+    ]
+
+
+def scale_plane_origin(plane, scale):
+    p = rg.Plane(plane)
+    p.Origin = rg.Point3d(
+        p.Origin.X * scale,
+        p.Origin.Y * scale,
+        p.Origin.Z * scale
+    )
+    return p
+
+
+def plane_origin_transform(parent_plane, xyz, rpy):
+    """
+    Same as Comp3: URDF joint origin translated in the parent frame, then
+    fixed-axis RPY about the PARENT axes (R = Rz Ry Rx).
+    """
+    px = rg.Vector3d(parent_plane.XAxis)
+    py = rg.Vector3d(parent_plane.YAxis)
+    pz = rg.Vector3d(parent_plane.ZAxis)
+
+    origin = (
+        parent_plane.Origin
+        + px * xyz[0]
+        + py * xyz[1]
+        + pz * xyz[2]
+    )
+
+    joint_plane = rg.Plane(parent_plane)
+    joint_plane.Origin = origin
+
+    roll, pitch, yaw = rpy
+    if abs(roll) > 1e-15:
+        joint_plane.Transform(rg.Transform.Rotation(roll, px, origin))
+    if abs(pitch) > 1e-15:
+        joint_plane.Transform(rg.Transform.Rotation(pitch, py, origin))
+    if abs(yaw) > 1e-15:
+        joint_plane.Transform(rg.Transform.Rotation(yaw, pz, origin))
+
+    return joint_plane
+
+
+def pins_changed(pins, pin0, tol=1e-6):
+    if not pin0 or len(pin0) < len(pins):
+        return True
+    for a, b in zip(pins, pin0):
+        if abs(float(a) - float(b)) > tol:
+            return True
+    return False
+
+
+def build_cartesian_target_m(lock_plane, pin_vals, pin0, display_scale):
+    """
+    Build the IK target TCP plane in URDF meters.
+
+    Position: absolute robot-base mm from X/Y/Z once those pins move; otherwise
+    keep the locked TCP origin.
+
+    Orientation: always the locked TCP frame plus Rx/Ry/Rz deltas about that
+    TCP's own axes (centered on the TCP tip, not the flange). Absolute RPY
+    from near-zero panels was flipping the tool because entry orientation is
+    typically near 180 deg, not 0.
+    """
+    lock = rg.Plane(lock_plane)
+    s = float(display_scale) if abs(float(display_scale)) > 1e-12 else 1000.0
+
+    xyz_pins = list(pin_vals[:3])
+    xyz0 = list(pin0[:3])
+    rpy_pins = list(pin_vals[3:6])
+    rpy0 = list(pin0[3:6])
+
+    if pins_changed(xyz_pins, xyz0):
+        origin = rg.Point3d(
+            float(xyz_pins[0]) / s,
+            float(xyz_pins[1]) / s,
+            float(xyz_pins[2]) / s
+        )
+    else:
+        origin = rg.Point3d(lock.Origin)
+
+    target = rg.Plane(lock)
+    target.Origin = origin
+
+    # Freeze tool axes from the lock frame; apply deltas about the TCP origin.
+    tx = rg.Vector3d(lock.XAxis)
+    ty = rg.Vector3d(lock.YAxis)
+    tz = rg.Vector3d(lock.ZAxis)
+    if tx.Length > 1e-12:
+        tx.Unitize()
+    if ty.Length > 1e-12:
+        ty.Unitize()
+    if tz.Length > 1e-12:
+        tz.Unitize()
+
+    drx = math.radians(float(rpy_pins[0]) - float(rpy0[0]))
+    dry = math.radians(float(rpy_pins[1]) - float(rpy0[1]))
+    drz = math.radians(float(rpy_pins[2]) - float(rpy0[2]))
+
+    if abs(drx) > 1e-15:
+        target.Transform(rg.Transform.Rotation(drx, tx, origin))
+    if abs(dry) > 1e-15:
+        target.Transform(rg.Transform.Rotation(dry, ty, origin))
+    if abs(drz) > 1e-15:
+        target.Transform(rg.Transform.Rotation(drz, tz, origin))
+
+    return target
+
+
+def axis_world_from_joint_plane(joint_plane, axis_xyz):
+    v = (
+        rg.Vector3d(joint_plane.XAxis) * axis_xyz[0]
+        + rg.Vector3d(joint_plane.YAxis) * axis_xyz[1]
+        + rg.Vector3d(joint_plane.ZAxis) * axis_xyz[2]
+    )
+    if v.Length > 1e-12:
+        v.Unitize()
+    return v
+
+
+def tcp_plane_from_flange(flange_plane, tcp_local):
+    if tcp_local is None:
+        return flange_plane
+    p = rg.Plane(tcp_local)
+    p.Transform(rg.Transform.PlaneToPlane(rg.Plane.WorldXY, flange_plane))
+    return p
+
+
+def chain_joint_values(track_m, joints_rad, travel_mm, rail_mm):
+    values = {
+        "track_joint": track_pose_to_urdf_meters(track_m, travel_mm, rail_mm)
+    }
+    for i in range(6):
+        values["joint_{}".format(i + 1)] = joints_rad[i]
+    return values
+
+
+def chain_fk(chain, values):
+    plane = rg.Plane.WorldXY
+    axes = {}
+
+    for entry in chain:
+        plane = plane_origin_transform(plane, entry["xyz"], entry["rpy"])
+        jtype = entry["type"]
+        if jtype == "fixed":
             continue
 
-        if isinstance(item, rg.Mesh):
-            meshes.append(item)
+        axis_world = axis_world_from_joint_plane(plane, entry["axis"])
+        axes[entry["name"]] = (axis_world, rg.Point3d(plane.Origin))
+
+        value = values.get(entry["name"], 0.0)
+        if jtype == "prismatic":
+            plane.Origin = plane.Origin + axis_world * value
+        elif abs(value) > 1e-15:
+            plane.Transform(
+                rg.Transform.Rotation(value, axis_world, plane.Origin)
+            )
+
+    return plane, axes
+
+
+def rotation_matrix_from_plane(plane):
+    x = rg.Vector3d(plane.XAxis)
+    y = rg.Vector3d(plane.YAxis)
+    z = rg.Vector3d(plane.ZAxis)
+    x.Unitize()
+    y.Unitize()
+    z.Unitize()
+    return [
+        [x.X, y.X, z.X],
+        [x.Y, y.Y, z.Y],
+        [x.Z, y.Z, z.Z]
+    ]
+
+
+def rotation_error_vector(current_plane, target_plane):
+    rc = rotation_matrix_from_plane(current_plane)
+    rt = rotation_matrix_from_plane(target_plane)
+    r = [[0.0] * 3 for _ in range(3)]
+    for i in range(3):
+        for j in range(3):
+            r[i][j] = sum(rt[i][k] * rc[j][k] for k in range(3))
+
+    trace = r[0][0] + r[1][1] + r[2][2]
+    angle = math.acos(clamp((trace - 1.0) * 0.5, -1.0, 1.0))
+    if angle < 1e-9:
+        return rg.Vector3d(0.0, 0.0, 0.0), 0.0
+
+    if angle < math.pi - 1e-6:
+        s = angle / (2.0 * math.sin(angle))
+        return rg.Vector3d(
+            (r[2][1] - r[1][2]) * s,
+            (r[0][2] - r[2][0]) * s,
+            (r[1][0] - r[0][1]) * s
+        ), angle
+
+    axis = [0.0, 0.0, 0.0]
+    for i in range(3):
+        axis[i] = math.sqrt(max(0.0, (r[i][i] + 1.0) * 0.5))
+    if axis[0] >= axis[1] and axis[0] >= axis[2]:
+        axis[1] = r[0][1] / (2.0 * axis[0] + 1e-12)
+        axis[2] = r[0][2] / (2.0 * axis[0] + 1e-12)
+    elif axis[1] >= axis[2]:
+        axis[0] = r[0][1] / (2.0 * axis[1] + 1e-12)
+        axis[2] = r[1][2] / (2.0 * axis[1] + 1e-12)
+    else:
+        axis[0] = r[0][2] / (2.0 * axis[2] + 1e-12)
+        axis[1] = r[1][2] / (2.0 * axis[2] + 1e-12)
+    return rg.Vector3d(axis[0] * angle, axis[1] * angle, axis[2] * angle), angle
+
+
+def plane_error(current_plane, target_plane, rotation_weight):
+    dp = target_plane.Origin - current_plane.Origin
+    er, _ = rotation_error_vector(current_plane, target_plane)
+    return [
+        float(dp.X),
+        float(dp.Y),
+        float(dp.Z),
+        float(er.X) * rotation_weight,
+        float(er.Y) * rotation_weight,
+        float(er.Z) * rotation_weight
+    ]
+
+
+def error_norm(err):
+    return math.sqrt(sum(v * v for v in err))
+
+
+def jacobian_from_axes(axes, joint_info, names, tcp_point):
+    J = [[0.0 for _ in range(len(names))] for _ in range(6)]
+    for col, name in enumerate(names):
+        entry = axes.get(name, None)
+        if entry is None:
             continue
+        axis_world, joint_origin = entry
+        info = joint_info.get(name, None)
+        jtype = info.get("type", "revolute") if info else "revolute"
+        if jtype == "prismatic":
+            linear = rg.Vector3d(axis_world)
+            angular = rg.Vector3d(0, 0, 0)
+        else:
+            linear = rg.Vector3d.CrossProduct(axis_world, tcp_point - joint_origin)
+            angular = rg.Vector3d(axis_world)
+        J[0][col] = float(linear.X)
+        J[1][col] = float(linear.Y)
+        J[2][col] = float(linear.Z)
+        J[3][col] = float(angular.X)
+        J[4][col] = float(angular.Y)
+        J[5][col] = float(angular.Z)
+    return J
 
-        if isinstance(item, rg.Brep):
-            for m in (rg.Mesh.CreateFromBrep(item, rg.MeshingParameters.Default) or []):
-                meshes.append(m)
 
-    return meshes
+def mat_transpose(A):
+    return [[A[r][c] for r in range(len(A))] for c in range(len(A[0]))]
+
+
+def mat_mul(A, B):
+    rows = len(A)
+    cols = len(B[0])
+    inner = len(B)
+    out = []
+    for r in range(rows):
+        row = []
+        for c in range(cols):
+            s = 0.0
+            for k in range(inner):
+                s += A[r][k] * B[k][c]
+            row.append(s)
+        out.append(row)
+    return out
+
+
+def mat_vec_mul(A, x):
+    return [sum(a * b for a, b in zip(row, x)) for row in A]
+
+
+def solve_linear_system(A, b):
+    n = len(A)
+    M = [list(row) for row in A]
+    y = list(b)
+
+    for k in range(n):
+        pivot = k
+        pivot_abs = abs(M[k][k])
+        for r in range(k + 1, n):
+            if abs(M[r][k]) > pivot_abs:
+                pivot_abs = abs(M[r][k])
+                pivot = r
+        if pivot_abs < 1e-12:
+            return [0.0 for _ in range(n)]
+        if pivot != k:
+            M[k], M[pivot] = M[pivot], M[k]
+            y[k], y[pivot] = y[pivot], y[k]
+        for r in range(k + 1, n):
+            factor = M[r][k] / M[k][k]
+            for c in range(k, n):
+                M[r][c] -= factor * M[k][c]
+            y[r] -= factor * y[k]
+
+    x = [0.0 for _ in range(n)]
+    for i in reversed(range(n)):
+        s = y[i]
+        for j in range(i + 1, n):
+            s -= M[i][j] * x[j]
+        if abs(M[i][i]) < 1e-12:
+            x[i] = 0.0
+        else:
+            x[i] = s / M[i][i]
+    return x
+
+
+def damped_least_squares(J, err, damping):
+    JT = mat_transpose(J)
+    JTJ = mat_mul(JT, J)
+    JTe = mat_vec_mul(JT, err)
+    n = len(JTJ)
+    for i in range(n):
+        JTJ[i][i] += damping * damping
+    return solve_linear_system(JTJ, JTe)
+
+
+def active_joint_names():
+    return list(MOTION_JOINT_NAMES)
+
+
+def get_bounds(joint_info, names):
+    lower = []
+    upper = []
+    for name in names:
+        info = joint_info.get(name, None)
+        if info is None:
+            if name == "track_joint":
+                lower.append(0.0)
+                upper.append(1.0)
+            else:
+                lower.append(-math.pi)
+                upper.append(math.pi)
+        else:
+            lower.append(info["lower"])
+            upper.append(info["upper"])
+    return lower, upper
+
+
+def bound_q(q, lower, upper):
+    return [clamp(v, lo, hi) for v, lo, hi in zip(q, lower, upper)]
+
+
+def damp_track_column_if_at_limit(J, q, names):
+    if not names or names[0] != "track_joint":
+        return J
+    track = q[0]
+    if track < 0.04 or track > 0.96:
+        scale = 0.10
+    elif track < 0.10 or track > 0.90:
+        scale = 0.35
+    else:
+        scale = 1.0
+    if scale < 1.0:
+        for r in range(len(J)):
+            J[r][0] *= scale
+    return J
+
+
+def limit_aware_step(dq, q, names):
+    if not names or names[0] != "track_joint":
+        return dq
+    track = q[0]
+    if track <= 0.005 and dq[0] < 0.0:
+        dq[0] = 0.0
+    if track >= 0.995 and dq[0] > 0.0:
+        dq[0] = 0.0
+    if track < 0.06 and dq[0] < 0.0:
+        dq[0] *= 0.15
+    if track > 0.94 and dq[0] > 0.0:
+        dq[0] *= 0.15
+    return dq
+
+
+def solve_cartesian_jog(chain, joint_info, target_tcp_m, tcp_local,
+                        seed_track_m, seed_joints_rad, travel_mm, rail_mm,
+                        rot_weight=0.16, max_iters=45,
+                        pos_tol=0.0005, rot_tol=None):
+    """
+    Analytic geometric-Jacobian DLS IK (same core as Comp3 single-seed).
+    Much more stable than finite-difference COMPAS FK for live jogging.
+    """
+    if rot_tol is None:
+        rot_tol = math.radians(0.5)
+
+    if not chain:
+        return False, seed_track_m, list(seed_joints_rad[:6]), None, 999999.0
+
+    damping = 0.05
+    track_scale = track_pose_to_urdf_meters(1.0, travel_mm, rail_mm)
+    names = active_joint_names()
+    lower, upper = get_bounds(joint_info, names)
+
+    q = [clamp(seed_track_m, 0.0, 1.0)] + [float(v) for v in seed_joints_rad[:6]]
+    while len(q) < 7:
+        q.append(0.0)
+    q = bound_q(q, lower, upper)
+
+    best_error = 999999.0
+    best_track = q[0]
+    best_joints = list(q[1:7])
+    best_plane = None
+    previous_error = None
+    stagnant_count = 0
+
+    for _ in range(max_iters):
+        track_m = q[0]
+        joints_rad = list(q[1:7])
+        flange_plane, joint_axes = chain_fk(
+            chain,
+            chain_joint_values(track_m, joints_rad, travel_mm, rail_mm)
+        )
+        tcp_plane = tcp_plane_from_flange(flange_plane, tcp_local)
+        if tcp_plane is None:
+            break
+
+        err = plane_error(tcp_plane, target_tcp_m, rot_weight)
+        en = error_norm(err)
+        if en < best_error:
+            best_error = en
+            best_track = track_m
+            best_joints = list(joints_rad)
+            best_plane = tcp_plane
+
+        dp = target_tcp_m.Origin - tcp_plane.Origin
+        _, rot_ang = rotation_error_vector(tcp_plane, target_tcp_m)
+        if dp.Length < pos_tol and rot_ang < rot_tol:
+            return True, track_m, joints_rad, tcp_plane, en
+
+        if previous_error is not None:
+            if abs(previous_error - en) < 0.00002:
+                stagnant_count += 1
+            else:
+                stagnant_count = 0
+            if stagnant_count >= 8:
+                break
+        previous_error = en
+
+        J = jacobian_from_axes(joint_axes, joint_info, names, tcp_plane.Origin)
+        for r in (3, 4, 5):
+            for c in range(len(J[r])):
+                J[r][c] *= rot_weight
+        if names and names[0] == "track_joint":
+            for r in range(len(J)):
+                J[r][0] *= track_scale
+
+        J = damp_track_column_if_at_limit(J, q, names)
+        dq = damped_least_squares(J, err, damping)
+        dq = limit_aware_step(dq, q, names)
+
+        for i in range(len(dq)):
+            if names[i] == "track_joint":
+                dq[i] = clamp(dq[i], -0.030, 0.030)
+            else:
+                dq[i] = clamp(dq[i], -0.080, 0.080)
+
+        for i in range(len(q)):
+            q[i] += dq[i]
+        q = bound_q(q, lower, upper)
+
+    if best_plane is not None:
+        dp = target_tcp_m.Origin - best_plane.Origin
+        _, rot_ang = rotation_error_vector(best_plane, target_tcp_m)
+        ok = dp.Length < pos_tol and rot_ang < rot_tol
+    else:
+        ok = False
+
+    return ok, best_track, best_joints, best_plane, best_error
+
 
 
 def draw_tool_meshes(tool_meshes, flange_plane):
@@ -838,53 +1531,35 @@ def build_rj_command(
     )
 
 
-def send_single_command(port, baud, command, timeout):
-    """Open, send one RJ, wait for the position reply, close."""
-    import serial
+SERIAL_BUS_KEY = "AR4_SERIAL_BUS"
 
-    ser = serial.Serial(
-        port=port,
-        baudrate=baud,
-        timeout=0.1,
-        write_timeout=2.0
-    )
 
-    # Teensy resets on port open.
-    time.sleep(2.0)
-
+def get_connected_bus():
+    if sc is None:
+        return None
+    bus = sc.sticky.get(SERIAL_BUS_KEY)
+    if bus is None:
+        return None
     try:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+        if bus.is_connected():
+            return bus
     except Exception:
-        pass
+        return None
+    return None
 
-    try:
-        ser.write((command.strip() + "\n").encode("utf-8"))
-        ser.flush()
 
-        buffer = ""
-        start = time.time()
+def send_single_command(command, timeout):
+    """Send one RJ through Comp1's open SerialBus. Does not open/close the port."""
+    bus = get_connected_bus()
+    if bus is None:
+        return "", "NO_BUS"
 
-        while time.time() - start < timeout:
-            if ser.in_waiting > 0:
-                buffer += ser.read(ser.in_waiting).decode("utf-8", errors="ignore")
-
-                for line in [l.strip() for l in buffer.splitlines() if l.strip()]:
-                    if line == "ER" or line.startswith("EL"):
-                        return buffer, "FIRMWARE_" + line[:2]
-
-                    if line.startswith("A") and "B" in line and "P" in line:
-                        return buffer, "RP"
-
-            time.sleep(0.02)
-
-        return buffer, "TIMEOUT" if buffer else "TIMEOUT_EMPTY"
-
-    finally:
-        try:
-            ser.close()
-        except Exception:
-            pass
+    status_code, line = bus.send_and_wait(command, timeout, accept_any_line=False)
+    if status_code == "RP":
+        return line, "RP"
+    if status_code.startswith("ERROR"):
+        return line, "FIRMWARE_" + status_code.replace("ERROR_", "")
+    return line or "", status_code
 
 
 # ------------------------------------------------------------
@@ -952,6 +1627,9 @@ skeleton_lines = []
 
 flange_plane = rg.Plane.Unset
 tcp_plane = rg.Plane.Unset
+joints_urdf_deg = [0.0] * 6
+xyz_mm = [0.0, 0.0, 0.0]
+rpy_deg = [0.0, 0.0, 0.0]
 
 rj_command = ""
 captures = []
@@ -998,7 +1676,27 @@ try:
         track_inverted = sc.sticky.get("AR4_TRACK_FIRMWARE_INVERTED", False)
     track_inverted = to_bool(track_inverted, False)
 
-    joints_deg = [
+    mode_raw = to_text(gh_input("Mode", "joint"), "joint").strip().lower()
+    if mode_raw in ["cart", "xyz", "tcp", "cartesian", "abs", "absolute", "jog"]:
+        mode = "cartesian"
+    else:
+        mode = "joint"
+
+    track_m = clamp(to_float(gh_input("TrackM", 0.0), 0.0), 0.0, 1.0)
+    tcp_local, tcp_source = resolve_tcp_frame()
+
+    urdf_path = get_urdf_path_from_cache(cache_id)
+    fk_chain = get_fk_chain(cache_id, urdf_path, tool_link) if urdf_path else []
+    joint_info = get_joint_info(cache_id, urdf_path) if urdf_path else {}
+
+    # Seed joints from sticky so Cartesian <-> joint stays continuous.
+    seed_joints = None
+    if sc is not None:
+        prev = sc.sticky.get("AR4_JOG_LAST_JOINTS_DEG", None)
+        if isinstance(prev, (list, tuple)) and len(prev) >= 6:
+            seed_joints = [to_float(v, 0.0) for v in prev[:6]]
+
+    joint_slider_deg = [
         to_float(gh_input("J1", 0.0), 0.0),
         to_float(gh_input("J2", 0.0), 0.0),
         to_float(gh_input("J3", 0.0), 0.0),
@@ -1006,10 +1704,125 @@ try:
         to_float(gh_input("J5", 0.0), 0.0),
         to_float(gh_input("J6", 0.0), 0.0)
     ]
-    joints_rad = [math.radians(v) for v in joints_deg]
 
-    track_m = clamp(to_float(gh_input("TrackM", 0.0), 0.0), 0.0, 1.0)
+    prev_mode = to_text(sc.sticky.get("AR4_JOG_LAST_MODE", "joint"), "joint") if sc else "joint"
+    entered_cart = (mode == "cartesian" and prev_mode != "cartesian")
+    if sc is not None:
+        sc.sticky["AR4_JOG_LAST_MODE"] = mode
+
+    if mode == "cartesian":
+        if seed_joints is None:
+            seed_joints = list(joint_slider_deg)
+
+        seed_track = track_m
+        if sc is not None:
+            st = sc.sticky.get("AR4_JOG_LAST_TRACK_M", None)
+            if st is not None:
+                seed_track = clamp(to_float(st, track_m), 0.0, 1.0)
+
+        if not fk_chain:
+            raise Exception(
+                "Cartesian jog needs the URDF path from Comp1 "
+                "(sticky '{}::startup_state'). Re-run Comp1 Load/Connect.".format(cache_id)
+            )
+
+        # Freeze the exact TCP plane at mode entry (no RPY round-trip).
+        if entered_cart or not isinstance(sc.sticky.get("AR4_JOG_CART_LOCK_PLANE"), rg.Plane):
+            lock_joints = [math.radians(v) for v in seed_joints]
+            flange_lock, _ = chain_fk(
+                fk_chain,
+                chain_joint_values(seed_track, lock_joints, travel_mm, rail_mm)
+            )
+            tcp_lock = tcp_plane_from_flange(flange_lock, tcp_local)
+            sc.sticky["AR4_JOG_CART_LOCK_PLANE"] = rg.Plane(tcp_lock)
+            lock_mm = scale_plane_origin(tcp_lock, display_scale)
+            sc.sticky["AR4_JOG_CART_LOCK_XYZ"] = [
+                float(lock_mm.Origin.X),
+                float(lock_mm.Origin.Y),
+                float(lock_mm.Origin.Z)
+            ]
+            sc.sticky["AR4_JOG_CART_LOCK_RPY"] = rpy_deg_from_plane(lock_mm)
+            sc.sticky["AR4_JOG_CART_PIN0"] = [
+                to_float(gh_input("X", 0.0), 0.0),
+                to_float(gh_input("Y", 0.0), 0.0),
+                to_float(gh_input("Z", 0.0), 0.0),
+                to_float(gh_input("Rx", 0.0), 0.0),
+                to_float(gh_input("Ry", 0.0), 0.0),
+                to_float(gh_input("Rz", 0.0), 0.0)
+            ]
+            sc.sticky["AR4_JOG_CART_USE_PINS"] = False
+
+        pin_vals = [
+            to_float(gh_input("X", 0.0), 0.0),
+            to_float(gh_input("Y", 0.0), 0.0),
+            to_float(gh_input("Z", 0.0), 0.0),
+            to_float(gh_input("Rx", 0.0), 0.0),
+            to_float(gh_input("Ry", 0.0), 0.0),
+            to_float(gh_input("Rz", 0.0), 0.0)
+        ]
+        pin0 = list(sc.sticky.get("AR4_JOG_CART_PIN0") or pin_vals)
+        lock_plane = rg.Plane(sc.sticky["AR4_JOG_CART_LOCK_PLANE"])
+        lock_xyz = list(sc.sticky.get("AR4_JOG_CART_LOCK_XYZ") or [0.0, 0.0, 0.0])
+        lock_rpy = list(sc.sticky.get("AR4_JOG_CART_LOCK_RPY") or [0.0, 0.0, 0.0])
+
+        if pins_changed(pin_vals, pin0):
+            sc.sticky["AR4_JOG_CART_USE_PINS"] = True
+
+        if sc.sticky.get("AR4_JOG_CART_USE_PINS", False):
+            target_m = build_cartesian_target_m(
+                lock_plane, pin_vals, pin0, display_scale
+            )
+            if pins_changed(pin_vals[:3], pin0[:3]):
+                x_mm, y_mm, z_mm = pin_vals[0], pin_vals[1], pin_vals[2]
+            else:
+                x_mm, y_mm, z_mm = lock_xyz
+            # Status shows commanded orientation = lock RPY + pin deltas.
+            rx_d = lock_rpy[0] + (pin_vals[3] - pin0[3])
+            ry_d = lock_rpy[1] + (pin_vals[4] - pin0[4])
+            rz_d = lock_rpy[2] + (pin_vals[5] - pin0[5])
+            cart_label = "TCP"
+        else:
+            target_m = rg.Plane(lock_plane)
+            x_mm, y_mm, z_mm = lock_xyz
+            rx_d, ry_d, rz_d = lock_rpy
+            cart_label = "HOLD"
+
+        ok_ik, track_m, joints_rad, _, ik_err = solve_cartesian_jog(
+            fk_chain,
+            joint_info,
+            target_m,
+            tcp_local,
+            seed_track,
+            [math.radians(v) for v in seed_joints],
+            travel_mm,
+            rail_mm
+        )
+        joints_deg = [math.degrees(v) for v in joints_rad]
+        if not ok_ik:
+            status_ik = "{} IK weak (err={:.4f}) tgt=({:.1f},{:.1f},{:.1f}/{:.1f},{:.1f},{:.1f})".format(
+                cart_label, ik_err, x_mm, y_mm, z_mm, rx_d, ry_d, rz_d
+            )
+        else:
+            status_ik = "{} IK ok (err={:.4f}) tgt=({:.1f},{:.1f},{:.1f}/{:.1f},{:.1f},{:.1f})".format(
+                cart_label, ik_err, x_mm, y_mm, z_mm, rx_d, ry_d, rz_d
+            )
+    else:
+        status_ik = "JOINT"
+        if sc is not None:
+            sc.sticky.pop("AR4_JOG_CART_LOCK_PLANE", None)
+            sc.sticky.pop("AR4_JOG_CART_LOCK_XYZ", None)
+            sc.sticky.pop("AR4_JOG_CART_LOCK_RPY", None)
+            sc.sticky.pop("AR4_JOG_CART_PIN0", None)
+            sc.sticky.pop("AR4_JOG_CART_USE_PINS", None)
+        joints_deg = list(joint_slider_deg)
+        joints_rad = [math.radians(v) for v in joints_deg]
+
+    joints_urdf_deg = list(joints_deg)
     j7_mm = track_m_to_j7_mm(track_m, travel_mm, track_inverted)
+
+    if sc is not None:
+        sc.sticky["AR4_JOG_LAST_JOINTS_DEG"] = list(joints_deg)
+        sc.sticky["AR4_JOG_LAST_TRACK_M"] = float(track_m)
 
     config = make_config(model, track_m, joints_rad, travel_mm, rail_mm)
     frame_by_link = get_frame_by_link(model, config)
@@ -1021,9 +1834,16 @@ try:
 
     flange_local = frame_to_local_plane(tool_frame)
     flange_plane = frame_to_plane(tool_frame, display_scale)
-
-    tcp_local, tcp_source = resolve_tcp_frame()
     tcp_plane = apply_tcp_frame(flange_plane, tcp_local, display_scale)
+
+    # Robot-base TCP readout (before world base transform): use local flange+tcp
+    tcp_local_disp = apply_tcp_frame(flange_local, tcp_local, display_scale)
+    xyz_mm = [
+        float(tcp_local_disp.Origin.X),
+        float(tcp_local_disp.Origin.Y),
+        float(tcp_local_disp.Origin.Z)
+    ]
+    rpy_deg = rpy_deg_from_plane(tcp_local_disp)
 
     # Display.
     tool_meshes = get_tool_meshes()
@@ -1090,21 +1910,17 @@ try:
     capture_count = len(captures)
     capture_labels = [c.get("label", "") for c in captures]
 
-    # Send.
-    port = to_text(gh_input("Port", ""), "")
-    baud = int(to_float(gh_input("Baud", 9600), 9600))
+    # Send through Comp1's open bus.
     send_requested = to_bool(gh_input("Send", False), False)
 
     if edge_triggered("AR4_JOG_SEND_EDGE", send_requested):
-        if not port:
-            send_note = "Send ignored: no Port"
+        reply, reply_status = send_single_command(
+            rj_command,
+            to_float(gh_input("SendTimeout", 30.0), 30.0)
+        )
+        if reply_status == "NO_BUS":
+            send_note = "Send ignored: Comp1 Connect is False"
         else:
-            reply, reply_status = send_single_command(
-                port,
-                baud,
-                rj_command,
-                to_float(gh_input("SendTimeout", 30.0), 30.0)
-            )
             send_note = "sent, reply {}".format(reply_status)
             sc.sticky["AR4_JOG_LAST_REPLY"] = reply
     elif send_requested:
@@ -1115,7 +1931,10 @@ try:
     jog_state = {
         "cache_id": cache_id,
         "tool_link": tool_link,
+        "mode": mode,
         "joints_urdf_deg": list(joints_deg),
+        "xyz_mm": list(xyz_mm),
+        "rpy_deg": list(rpy_deg),
         "track_m": track_m,
         "j7_mm": j7_mm,
         "flange_origin_m": [
@@ -1136,14 +1955,16 @@ try:
     }
 
     status = (
-        "Comp6 jog | J {} | TrackM {:.4f} (J7 {:.1f} mm) | "
-        "TCP {} | base {} | encode {} | captures {} | {} | {}"
+        "Comp6 {} | {} | J {} | XYZ {} | RPY {} | TrackM {:.4f} | "
+        "TCP {} | encode {} | captures {} | {} | {}"
     ).format(
+        mode,
+        status_ik,
         [round(v, 2) for v in joints_deg],
+        [round(v, 1) for v in xyz_mm],
+        [round(v, 1) for v in rpy_deg],
         track_m,
-        j7_mm,
         tcp_source,
-        base_plane_source,
         "ON" if encode else "OFF",
         capture_count,
         capture_note,

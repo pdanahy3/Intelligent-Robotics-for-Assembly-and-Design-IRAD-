@@ -1,6 +1,36 @@
 #! python3
 # r: pyserial
 
+# =============================================================================
+# GH_PINS — Rhino does not create pins from pasted code. Copy these names into
+# the Python Script component UI (Type Hint / Access in COMPONENT_PINS.txt).
+# INPUTS:
+#   Mode
+#   J1
+#   J2
+#   J3
+#   J4
+#   J5
+#   J6
+#   J7
+#   J8
+#   J9
+#   Run
+#   Timeout
+# OUTPUTS:
+#   sent_command
+#   reply_lines
+#   raw_reply
+#   joint_values_deg
+#   joint_values_rad
+#   cartesian_pose
+#   external_axes_mm
+#   j7_mm
+#   track_m
+#   calibration_state
+#   status
+# =============================================================================
+
 import time
 import math
 
@@ -350,66 +380,62 @@ def parse_tl(tl):
 
 
 # ------------------------------------------------------------
-# Helpers: serial
+# Helpers: serial (via Comp1 bus)
 # ------------------------------------------------------------
 
-def send_serial_command(port, baud, command, timeout, ignore_timeout=False):
-    import serial
+SERIAL_BUS_KEY = "AR4_SERIAL_BUS"
 
-    ser = serial.Serial(
-        port=port,
-        baudrate=baud,
-        timeout=0.1,
-        write_timeout=2.0
-    )
 
-    # Teensy serial settle.
-    time.sleep(2.0)
-
+def get_connected_bus():
+    if sc is None:
+        return None
+    bus = sc.sticky.get(SERIAL_BUS_KEY)
+    if bus is None:
+        return None
     try:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
+        if bus.is_connected():
+            return bus
     except Exception:
-        pass
+        return None
+    return None
 
-    wire_command = command.strip() + "\n"
 
-    ser.write(wire_command.encode("utf-8"))
-    ser.flush()
+def send_serial_command(command, timeout, ignore_timeout=False):
+    """
+    Send one firmware command through Comp1's open SerialBus.
+    Does not open or close the COM port.
+    """
+    bus = get_connected_bus()
+    if bus is None:
+        raise Exception(
+            "Serial bus not connected. Set Comp1 Connect=True and leave it on."
+        )
 
-    start = time.time()
-    buffer = ""
+    wire = command.strip()
+    accept_any = wire.upper().startswith("TL") or wire.upper().startswith("HO")
 
-    try:
+    if ignore_timeout:
+        # J7 LL can run longer than Timeout; poll until an RP arrives.
+        bus.clear_acks()
+        bus.write_command(wire)
+        lines = []
+        buffer = ""
         while True:
-            if (not ignore_timeout) and (time.time() - start >= timeout):
-                break
-
-            if ser.in_waiting > 0:
-                data = ser.read(ser.in_waiting)
-                text = data.decode("utf-8", errors="ignore")
-                buffer += text
-
-                # TL and RP should return one line.
-                if command.startswith("TL") or command.startswith("RP"):
-                    if "\n" in buffer:
-                        break
-
-                # LL can take longer and should eventually return an RP-style line.
-                if command.startswith("LL"):
-                    if clean_rp_reply(buffer):
-                        break
-
-            time.sleep(0.05)
-    finally:
-        try:
-            ser.close()
-        except Exception:
-            pass
-
-    lines = [line.strip() for line in buffer.splitlines() if line.strip()]
-
-    return wire_command.strip(), lines, buffer
+            status_code, line = bus.wait_ack(1.0, accept_any_line=False)
+            if line:
+                lines.append(line)
+                buffer = (buffer + "\n" + line).strip()
+            if status_code == "RP" or status_code.startswith("ERROR"):
+                return wire, lines, buffer
+            # Keep waiting on empty timeouts.
+    else:
+        status_code, line = bus.send_and_wait(
+            wire,
+            timeout,
+            accept_any_line=accept_any
+        )
+        lines = [line] if line else []
+        return wire, lines, line or ""
 
 
 # ------------------------------------------------------------
@@ -439,8 +465,6 @@ try:
     if sc is None:
         raise Exception("scriptcontext is not available.")
 
-    port = to_text(Port, "").strip()
-    baud = int(to_float(Baud, 9600))
     mode = normalize_mode(Mode)
     run = to_bool(Run, False)
     timeout = to_float(Timeout, 120.0)
@@ -458,14 +482,14 @@ try:
     ]
 
     selected = selected_joint_names(flags)
+    bus = get_connected_bus()
 
-    if not port:
-        status = "No Port provided."
-
-    elif baud <= 0:
-        status = "Invalid Baud value."
+    if bus is None:
+        status = "Serial bus not connected. Set Comp1 Connect=True and leave it on."
 
     else:
+        port = getattr(bus, "port", "")
+        baud = getattr(bus, "baud", 0)
         # Build command based on mode.
         if mode == "TL":
             command = "TL"
@@ -521,8 +545,6 @@ try:
                     )
 
                 sent_command, reply_lines, raw_reply = send_serial_command(
-                    port,
-                    baud,
                     command,
                     timeout,
                     ignore_timeout=ignore_timeout

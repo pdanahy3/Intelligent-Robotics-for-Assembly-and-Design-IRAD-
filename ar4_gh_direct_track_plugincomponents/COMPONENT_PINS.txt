@@ -1,0 +1,94 @@
+================================================================================
+AR4 component pin sheet — copy names into the Grasshopper Python 3 Script UI
+================================================================================
+
+Rhino 8 does NOT create input/output pins from pasted Python. Use this sheet
+(or the GH_PINS block at the top of each .py).
+
+SERIAL OWNERSHIP
+  Comp1 owns the COM port (Connect=True for the session).
+  Comp2 / Comp5 / Comp6 have NO Port/Baud pins.
+
+TOOL / TCP OWNERSHIP
+  Comp1 owns ToolMeshes / ToolTCPPlane / ToolTCPPoint.
+  Comp7 may override with AR4_TCP_FRAME after calibration.
+  Comp3 / Comp4 / Comp5 / Comp6 do NOT take ToolMeshes or TCP pins.
+
+================================================================================
+01  Startup / Connection
+================================================================================
+INPUTS: Load, Reload, URDF, PackageRoot, PreferredPort, Baud, TestCommand,
+        Connect, BasePlane, ToolMeshes (Mesh List), ToolTCPPlane, ToolTCPPoint
+OUTPUTS: cache_id, robot_model, robot_name, joint_names, motion_joint_names,
+         link_names, mesh_link_names, mesh_count, available_ports, active_port,
+         connected, handshake_reply, live_joint_values_deg, live_j7_mm,
+         live_track_m, live_rp_raw, base_plane, tool_meshes, tool_tcp_plane,
+         startup_state (No Type Hint), status
+
+================================================================================
+02  Calibration  (requires Comp1 Connect=True)
+================================================================================
+INPUTS: Mode, J1..J9, Run, Timeout
+OUTPUTS: sent_command, reply_lines, raw_reply, joint_values_deg,
+         joint_values_rad, cartesian_pose, external_axes_mm, j7_mm, track_m,
+         calibration_state (No Type Hint), status
+
+================================================================================
+03  Program / IK Planner
+================================================================================
+INPUTS: cache_id (from Comp1), Targets (Plane List), Speed, Accel, Decel, Ramp,
+        Wrist, UseTrack, Solve, UseCalibratedTCP, PosTolMM, RotTolDeg,
+        RotationWeight, MaxSeeds, MaxSolveSeconds, BasePlane, TargetUnitsMM,
+        SplitTrackMotion, TrackSpeedPercent, TrackLengthMM, TrackRailLengthMM,
+        TrackMoveEpsilonMM, TrackFirmwareInverted, HomeJointsDeg (float List),
+        JointSigns (float List), UseCalibrationFrame
+OUTPUTS: solved, program_joint_values_rad, program_joint_values_deg,
+         program_track_m, program_j7_mm, rj_commands, ik_errors,
+         tcp_pos_error_mm, tcp_rot_error_deg, target_planes_robot,
+         tcp_planes_solved, program_state (No Type Hint), status
+
+================================================================================
+04  Simulation / Visualization
+================================================================================
+INPUTS: Commands (str List), Time, DrawRobot, DrawTrack, DrawPath, DrawTargets,
+        DrawSkeleton, HideGripper, BasePlane, TrackLengthMM, TrackRailLengthMM,
+        TrackFirmwareInverted, HomeJointsDeg, JointSigns
+OUTPUTS: active_index, active_command, active_joint_values_deg,
+         active_joint_values_rad, active_track_m, active_j7_mm, robot_geometry,
+         tool_geometry, track_geometry, tcp_planes, tcp_path, target_geometry,
+         skeleton_lines, simulation_state (No Type Hint), status
+
+================================================================================
+05  Run / Serial Sender  (requires Comp1 Connect=True)
+================================================================================
+Streams one ack per GH solve and calls ExpireSolution so preview updates live.
+INPUTS: Commands, Run, Stop, Delay, WaitForReply, TimeoutPerCommand,
+        MaxInFlight, EncodeFirmwareOnSend, HomeJointsDeg, JointSigns, DrawRobot
+OUTPUTS: sent_commands, reply_lines, raw_replies, parsed_states (No Type Hint),
+         last_reply, last_rp_state (No Type Hint), run_index, completed,
+         failed_index, live_joint_values_deg, live_track_m, live_j7_mm,
+         flange_plane, tcp_plane, robot_geometry, tool_geometry, status
+
+================================================================================
+06  Jog / Pose Capture
+================================================================================
+Mode=joint uses J1..J6.
+Mode=cartesian|cart : X,Y,Z are absolute robot-base mm once moved (Comp3 frame).
+  Rx,Ry,Rz are deltas about the TCP tool axes (rotation centered on TCP tip).
+  Entering cartesian holds the current TCP until you move a pin.
+INPUTS: Mode, J1..J6, TrackM, X, Y, Z, Rx, Ry, Rz, Send, Capture, CaptureLabel,
+        ClearCaptures, Speed, SpeedType, Accel, Decel, Ramp, Wrist, SendTimeout,
+        EncodeFirmwareOnSend, DrawRobot, DrawTrack, DrawSkeleton, HideGripper,
+        BasePlane, TrackLengthMM, TrackRailLengthMM, TrackFirmwareInverted,
+        HomeJointsDeg, JointSigns
+OUTPUTS: robot_geometry, tool_geometry, track_geometry, skeleton_lines,
+         flange_plane, tcp_plane, joints_urdf_deg, xyz_mm, rpy_deg, rj_command,
+         captures (No Type Hint List), capture_count, capture_labels,
+         jog_state (No Type Hint), status
+
+================================================================================
+07  TCP Calibration
+================================================================================
+INPUTS: Captures (No Type Hint List), Solve, Apply, Clear, MaxAxisTiltDeg
+OUTPUTS: tcp_frame (No Type Hint), tcp_plane_local, tcp_offset_mm, fit_max_mm,
+         fit_rms_mm, calibration_point, warnings, status
